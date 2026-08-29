@@ -921,6 +921,7 @@ func cmdGen(args []string) error {
 	fl := flag.NewFlagSet("gen", flag.ContinueOnError)
 	length := fl.Int("len", 20, "password length (minimum 8)")
 	symbols := fl.Bool("symbols", false, "include punctuation symbols")
+	copyFlag := fl.Bool("copy", false, "copy password to clipboard")
 	if err := fl.Parse(args); err != nil {
 		return flagErr(err)
 	}
@@ -933,6 +934,13 @@ func cmdGen(args []string) error {
 
 	fmt.Println(green(string(pw))) // stdout: just the password
 	notef("%d chars, ~%.0f bits of entropy", *length, float64(*length)*math.Log2(float64(len(pool))))
+	if *copyFlag {
+		if copyToClipboard(string(pw)) {
+			okf("Copied to clipboard!")
+		} else {
+			warnf("Clipboard unavailable")
+		}
+	}
 	zero(pw)
 	return nil
 }
@@ -1104,11 +1112,58 @@ func menuPromptStr(label, def string) (string, error) {
 	return s, nil
 }
 
+func copyToClipboard(text string) bool {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("clip")
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	default:
+		if _, err := exec.LookPath("wl-copy"); err == nil {
+			cmd = exec.Command("wl-copy")
+		} else if _, err := exec.LookPath("xclip"); err == nil {
+			cmd = exec.Command("xclip", "-selection", "clipboard")
+		} else if _, err := exec.LookPath("xsel"); err == nil {
+			cmd = exec.Command("xsel", "-b")
+		} else {
+			return false
+		}
+	}
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run() == nil
+}
+
+// menuPromptFile prompts for a file path, retrying if the file does not exist.
+// Returns an error if the user cancels or input fails.
+func menuPromptFile(label, def string) (string, error) {
+	promptLabel := label
+	for {
+		path, err := menuPromptStr(promptLabel, def)
+		if err != nil {
+			return "", err
+		}
+		if path == "" {
+			return "", usagef("input cancelled")
+		}
+		if path == "q" {
+			return "", usagef("input cancelled")
+		}
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "  %s File not found: %s. Please enter a valid path (or 'q' to cancel):\n", yellow("⚠"), path)
+			promptLabel = "Valid path (or 'q' to cancel)"
+			def = ""
+			continue
+		}
+		return path, nil
+	}
+}
+
 // menuEncrypt interactively collects enc parameters and runs the encryption.
 func menuEncrypt() error {
-	inPath, err := menuPromptStr("Input file", "")
-	if err != nil || inPath == "" {
-		return usagef("input file is required")
+	inPath, err := menuPromptFile("Input file", "")
+	if err != nil {
+		return err
 	}
 	outPath, err := menuPromptStr("Output file", inPath+".enc")
 	if err != nil {
@@ -1150,9 +1205,9 @@ func menuEncrypt() error {
 
 // menuDecrypt interactively collects dec parameters and runs the decryption.
 func menuDecrypt() error {
-	inPath, err := menuPromptStr("Input file", "")
-	if err != nil || inPath == "" {
-		return usagef("input file is required")
+	inPath, err := menuPromptFile("Input file", "")
+	if err != nil {
+		return err
 	}
 	// Sensible default: strip .enc, or append .dec if there is no .enc suffix.
 	defOut := strings.TrimSuffix(inPath, ".enc")
@@ -1192,9 +1247,9 @@ func menuDecrypt() error {
 
 // menuView interactively views an encrypted file.
 func menuView() error {
-	inPath, err := menuPromptStr("Input file", "")
-	if err != nil || inPath == "" {
-		return usagef("input file is required")
+	inPath, err := menuPromptFile("Input file", "")
+	if err != nil {
+		return err
 	}
 	pass, err := resolvePass("", false)
 	if err != nil {
@@ -1220,9 +1275,9 @@ func menuView() error {
 
 // menuEdit interactively edits an encrypted file in place.
 func menuEdit() error {
-	inPath, err := menuPromptStr("Input file", "")
-	if err != nil || inPath == "" {
-		return usagef("input file is required")
+	inPath, err := menuPromptFile("Input file", "")
+	if err != nil {
+		return err
 	}
 	pass, err := resolvePass("", false)
 	if err != nil {
@@ -1277,9 +1332,9 @@ func menuEdit() error {
 
 // menuWipe interactively shreds a file.
 func menuWipe() error {
-	path, err := menuPromptStr("File to wipe", "")
-	if err != nil || path == "" {
-		return usagef("file path is required")
+	path, err := menuPromptFile("File to wipe", "")
+	if err != nil {
+		return err
 	}
 	
 	confirm, err := menuPromptStr(fmt.Sprintf("Type 'yes' to permanently shred %s", path), "")
@@ -1382,13 +1437,17 @@ func menuScan() error {
 
 // menuGen interactively generates a random password.
 func menuGen() error {
-	lenStr, err := menuPromptStr("Password length", "24")
-	if err != nil {
-		return err
-	}
 	var length int
-	if _, e := fmt.Sscanf(lenStr, "%d", &length); e != nil || length < 8 {
-		return usagef("invalid length %q (minimum 8)", lenStr)
+	for {
+		lenStr, err := menuPromptStr("Password length", "24")
+		if err != nil {
+			return err
+		}
+		if _, e := fmt.Sscanf(lenStr, "%d", &length); e != nil || length < 8 {
+			fmt.Fprintln(os.Stderr, "  "+yellow("⚠")+" Length must be at least 8 characters. Please try again:")
+			continue
+		}
+		break
 	}
 	symStr, err := menuPromptStr("Include symbols? (y/n)", "y")
 	if err != nil {
@@ -1406,21 +1465,28 @@ func menuGen() error {
 	// Print the password to stdout so it can be piped.
 	fmt.Println(green(string(pw)))
 	fmt.Fprintln(os.Stderr)
-	drawCard("PASSWORD GENERATED", [][2]string{
+
+	copied := copyToClipboard(string(pw))
+	rows := [][2]string{
 		{"Length", fmt.Sprintf("%d chars", length)},
 		{"Entropy", fmt.Sprintf("~%.0f bits (pool: %d chars)", entropy, len(pool))},
 		{"CSPRNG", "crypto/rand"},
 		{"Time", fmtDur(elapsed)},
-	}, true)
+	}
+	if copied {
+		rows = append(rows, [2]string{"Clipboard", "📋 Copied to clipboard!"})
+	}
+
+	drawCard("PASSWORD GENERATED", rows, true)
 	zero(pw)
 	return nil
 }
 
 // menuHash interactively streams a file through a hash function.
 func menuHash() error {
-	path, err := menuPromptStr("File path", "")
-	if err != nil || path == "" {
-		return usagef("file path is required")
+	path, err := menuPromptFile("File path", "")
+	if err != nil {
+		return err
 	}
 	algo, err := menuPromptStr("Algorithm (sha256/sha512)", "sha256")
 	if err != nil {
