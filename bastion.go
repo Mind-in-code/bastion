@@ -1453,7 +1453,7 @@ func drawDashboard() {
 	fmt.Fprintln(os.Stderr, green("│                                                      │"))
 	fmt.Fprintln(os.Stderr, green("├──────────────────────────────────────────────────────┤"))
 	fmt.Fprintln(os.Stderr, green("│  ")+"DIAGNOSTICS                                         "+green("│"))
-	fmt.Fprintln(os.Stderr, green("│    ")+yellow("[K/D]")+" Crypto Doctor (Self-Test) "+yellow("[B]")+" Benchmarks    "+green("│"))
+	fmt.Fprintln(os.Stderr, green("│    ")+yellow("[K]")+" Crypto Doctor (Self-Test) "+yellow("[B]")+" Benchmarks      "+green("│"))
 	fmt.Fprintln(os.Stderr, green("├──────────────────────────────────────────────────────┤"))
 	fmt.Fprintln(os.Stderr, green("│  ")+yellow("[?]")+" CLI Help                 "+yellow("[0/Q]")+" Quit             "+green("│"))
 	fmt.Fprintln(os.Stderr, green("╰──────────────────────────────────────────────────────╯"))
