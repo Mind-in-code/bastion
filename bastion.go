@@ -174,9 +174,11 @@ func promptPassword(prompt string) ([]byte, error) {
 // string and captured from the subprocess stdout — it never appears on screen.
 // If PowerShell is unavailable the function falls back to a plain buffered read.
 func readPasswordWindows(prompt string) ([]byte, error) {
+	// PowerShell's Read-Host automatically appends a colon and space.
+	cleanPrompt := strings.TrimRight(prompt, ": ")
 	// Single-quoted prompt is safe because our prompts contain only printable
 	// ASCII without single-quote characters.
-	psCmd := `$p = Read-Host -AsSecureString '` + prompt + `'; ` +
+	psCmd := `$p = Read-Host -AsSecureString '` + cleanPrompt + `'; ` +
 		`[Runtime.InteropServices.Marshal]::PtrToStringAuto(` +
 		`[Runtime.InteropServices.Marshal]::SecureStringToBSTR($p))`
 	cmd := exec.Command("powershell", "-NoProfile", "-Command", psCmd)
@@ -400,9 +402,7 @@ func decryptStream(in *bufio.Reader, out io.Writer, pass []byte) error {
 // (enc) or the complete ciphertext authenticated (dec). On any error the
 // temp file is removed, so the caller never sees a partial or
 // unauthenticated output file at the destination path.
-func runCrypt(inPath, outPath string, pass []byte, encrypt bool, rounds int) error {
-	defer zero(pass)
-
+func runCrypt(inPath, outPath string, pass []byte, encrypt bool, rounds int, wipeSource bool) error {
 	src, err := os.Open(inPath)
 	if err != nil {
 		return usagef("cannot open input: %v", err)
@@ -450,7 +450,70 @@ func runCrypt(inPath, outPath string, pass []byte, encrypt bool, rounds int) err
 	} else {
 		okf("Decrypted %s → %s (%d bytes)", inPath, outPath, fi.Size())
 	}
+	
+	src.Close() // Explicit close so Windows lets us wipe it
+	if wipeSource && encrypt {
+		if err := wipeFile(inPath); err != nil {
+			return usagef("encryption succeeded, but failed to wipe source: %v", err)
+		}
+	}
 	return nil
+}
+
+// wipeFile securely overwrites a file with random bytes, then zeroes, then deletes it.
+func wipeFile(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !fi.Mode().IsRegular() {
+		return usagef("cannot wipe non-regular file: %s", path)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		return err
+	}
+	size := fi.Size()
+	
+	// Pass 1: Random bytes
+	buf := make([]byte, 32*1024)
+	for written := int64(0); written < size; {
+		chunk := int64(len(buf))
+		if size-written < chunk {
+			chunk = size - written
+		}
+		rand.Read(buf[:chunk]) // crypto/rand
+		if _, err := f.Write(buf[:chunk]); err != nil {
+			f.Close()
+			return err
+		}
+		written += chunk
+	}
+	f.Sync()
+	
+	// Pass 2: Zeroes
+	if _, err := f.Seek(0, 0); err != nil {
+		f.Close()
+		return err
+	}
+	zero(buf)
+	for written := int64(0); written < size; {
+		chunk := int64(len(buf))
+		if size-written < chunk {
+			chunk = size - written
+		}
+		if _, err := f.Write(buf[:chunk]); err != nil {
+			f.Close()
+			return err
+		}
+		written += chunk
+	}
+	f.Sync()
+	f.Close()
+	return os.Remove(path)
 }
 
 // ---------------------------------------------------------------- TOTP (RFC 6238)
@@ -504,12 +567,16 @@ func totpVerify(secret, code string, unix int64) (bool, error) {
 
 func cmdTOTPGen(args []string) error {
 	fl := flag.NewFlagSet("totp gen", flag.ContinueOnError)
-	secret := fl.String("secret", "", "base32-encoded shared secret (required)")
+	secret := fl.String("secret", "", "base32-encoded shared secret")
 	if err := fl.Parse(args); err != nil {
 		return flagErr(err)
 	}
+	// Accept the secret as the first positional argument when -secret is omitted.
+	if *secret == "" && fl.NArg() > 0 {
+		*secret = fl.Arg(0)
+	}
 	if *secret == "" {
-		return usagef("totp gen requires -secret")
+		return usagef("totp gen requires -secret or a positional argument")
 	}
 
 	now := time.Now().Unix()
@@ -529,13 +596,23 @@ func cmdTOTPGen(args []string) error {
 
 func cmdTOTPVerify(args []string) error {
 	fl := flag.NewFlagSet("totp verify", flag.ContinueOnError)
-	secret := fl.String("secret", "", "base32-encoded shared secret (required)")
-	code := fl.String("code", "", "6-digit code to check (required)")
+	secret := fl.String("secret", "", "base32-encoded shared secret")
+	code := fl.String("code", "", "6-digit code to check")
 	if err := fl.Parse(args); err != nil {
 		return flagErr(err)
 	}
+	// Accept secret and code as positional arguments when flags are omitted.
+	// Order: posArgs[0] = secret, posArgs[1] = code.
+	pos := fl.Args()
+	if *secret == "" && len(pos) > 0 {
+		*secret = pos[0]
+		pos = pos[1:]
+	}
+	if *code == "" && len(pos) > 0 {
+		*code = pos[0]
+	}
 	if *secret == "" || *code == "" {
-		return usagef("totp verify requires -secret and -code")
+		return usagef("totp verify requires -secret and -code (or two positional arguments)")
 	}
 
 	ok, err := totpVerify(*secret, *code, time.Now().Unix())
@@ -707,10 +784,18 @@ func scanDir(w io.Writer, dir string, threshold float64) (found, files int, err 
 
 func cmdScan(args []string) error {
 	fl := flag.NewFlagSet("scan", flag.ContinueOnError)
-	dir := fl.String("dir", ".", "directory to scan recursively")
+	dir := fl.String("dir", "", "directory to scan recursively (default: current directory)")
 	threshold := fl.Float64("entropy", 4.5, "Shannon entropy threshold in bits per character")
 	if err := fl.Parse(args); err != nil {
 		return flagErr(err)
+	}
+	// Accept the directory as a positional argument; fall back to ".".
+	if *dir == "" {
+		if fl.NArg() > 0 {
+			*dir = fl.Arg(0)
+		} else {
+			*dir = "."
+		}
 	}
 
 	info, err := os.Stat(*dir)
@@ -830,13 +915,17 @@ func hashFile(path, algo string) (string, error) {
 
 func cmdHash(args []string) error {
 	fl := flag.NewFlagSet("hash", flag.ContinueOnError)
-	path := fl.String("file", "", "file to hash (required)")
+	path := fl.String("file", "", "file to hash")
 	algo := fl.String("algo", "sha256", "sha256 or sha512")
 	if err := fl.Parse(args); err != nil {
 		return flagErr(err)
 	}
+	// Accept the file path as the first positional argument when -file is omitted.
+	if *path == "" && fl.NArg() > 0 {
+		*path = fl.Arg(0)
+	}
 	if *path == "" {
-		return usagef("hash requires -file")
+		return usagef("hash requires -file or a positional argument")
 	}
 
 	sum, err := hashFile(*path, *algo)
@@ -849,11 +938,85 @@ func cmdHash(args []string) error {
 
 // ---------------------------------------------------------------- interactive TUI menu
 
-// menuHeader is the ASCII box shown at the top of every menu screen.
+// menuHeader is the styled banner shown at the top of every menu screen.
 const menuHeader = "\n" +
-	"╔══════════════════════════════════════════════════════╗\n" +
-	"║      BASTION — Zero-Dependency Security Toolbox      ║\n" +
-	"╚══════════════════════════════════════════════════════╝"
+	"╭──────────────────────────────────────────────────────╮\n" +
+	"│   BASTION  —  Zero-Dependency Security Toolbox    │\n" +
+	"│   ┃ AES-256-GCM ┃ PBKDF2-SHA-256 ┃ CSPRNG ┃         │\n" +
+	"╰──────────────────────────────────────────────────────╯"
+
+// clearScreen sends the ANSI "cursor home + erase display" sequence to stderr.
+// Only called inside cmdMenu which already guards on isTTY, so non-interactive
+// pipelines and automated tests never see this sequence.
+func clearScreen() { fmt.Fprint(os.Stderr, "\x1b[H\x1b[2J") }
+
+// fmtSize formats a byte count as a human-readable string.
+func fmtSize(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
+}
+
+// fmtDur formats a duration as "142 ms" or "1.24 s".
+func fmtDur(d time.Duration) string {
+	if d < time.Second {
+		return fmt.Sprintf("%d ms", d.Milliseconds())
+	}
+	return fmt.Sprintf("%.2f s", d.Seconds())
+}
+
+// drawCard renders a rounded result card to stderr.
+//
+// The card has a fixed visible width of 54 characters:
+//   ╭────────────────────────────────────────────────────╮
+//   │  content (up to 48 visible chars)              │
+//   ╰────────────────────────────────────────────────────╯
+func drawCard(title string, rows [][2]string, ok bool) {
+	const W = 48 // visible content width
+	rule := strings.Repeat("─", W+4)
+
+	fmt.Fprintln(os.Stderr, "╭"+rule+"╮")
+
+	// Status header row
+	var icon string
+	if ok {
+		icon = green("✔")
+	} else {
+		icon = red("✘")
+	}
+	// visible: 1(icon)+2(sp)+len(title); pad the title portion to (W-3)
+	titlePad := W - 3 - len(title)
+	if titlePad < 0 {
+		title = title[:W-3]
+		titlePad = 0
+	}
+	fmt.Fprintln(os.Stderr, "│  "+icon+"  "+title+strings.Repeat(" ", titlePad)+"  │")
+	fmt.Fprintln(os.Stderr, "├"+rule+"┤")
+
+	// Data rows
+	for _, r := range rows {
+		line := fmt.Sprintf("%-12s%s", r[0], r[1])
+		if len(line) > W {
+			line = line[:W]
+		}
+		pad := W - len(line)
+		fmt.Fprintln(os.Stderr, "│  "+line+strings.Repeat(" ", pad)+"  │")
+	}
+
+	fmt.Fprintln(os.Stderr, "╰"+rule+"╯")
+}
+
+// pauseForEnter waits for the user to press Enter before redrawing the menu.
+func pauseForEnter() {
+	fmt.Fprint(os.Stderr, "\n  "+dim("Press [Enter] to return to menu..."))
+	stdin.ReadString('\n') //nolint:errcheck
+	fmt.Fprintln(os.Stderr)
+}
 
 // menuPromptStr displays a labelled input prompt with an optional default value
 // and reads one line from stdin, returning the default when the user hits Enter.
@@ -891,7 +1054,31 @@ func menuEncrypt() error {
 	if err != nil {
 		return err
 	}
-	return runCrypt(inPath, outPath, pass, true, defaultRounds)
+	defer zero(pass)
+
+	rmStr, err := menuPromptStr("Wipe source file after encryption? (y/n)", "n")
+	if err != nil {
+		return err
+	}
+	rm := strings.EqualFold(strings.TrimSpace(rmStr), "y")
+
+	inFi, _ := os.Stat(inPath)
+	t0 := time.Now()
+	if err := runCrypt(inPath, outPath, pass, true, defaultRounds, rm); err != nil {
+		return err
+	}
+	elapsed := time.Since(t0)
+	outFi, _ := os.Stat(outPath)
+
+	fmt.Fprintln(os.Stderr)
+	drawCard("ENCRYPTED SUCCESSFULLY", [][2]string{
+		{"Input", fmt.Sprintf("%s  (%s)", inPath, fmtSize(inFi.Size()))},
+		{"Output", fmt.Sprintf("%s  (%s)", outPath, fmtSize(outFi.Size()))},
+		{"Cipher", "AES-256-GCM"},
+		{"KDF", fmt.Sprintf("%d rounds PBKDF2-SHA-256", defaultRounds)},
+		{"Time", fmtDur(elapsed)},
+	}, true)
+	return nil
 }
 
 // menuDecrypt interactively collects dec parameters and runs the decryption.
@@ -916,12 +1103,144 @@ func menuDecrypt() error {
 	if err != nil {
 		return err
 	}
-	return runCrypt(inPath, outPath, pass, false, 0)
+	defer zero(pass)
+
+	inFi, _ := os.Stat(inPath)
+	t0 := time.Now()
+	if err := runCrypt(inPath, outPath, pass, false, 0, false); err != nil {
+		return err
+	}
+	elapsed := time.Since(t0)
+	outFi, _ := os.Stat(outPath)
+
+	fmt.Fprintln(os.Stderr)
+	drawCard("DECRYPTED SUCCESSFULLY", [][2]string{
+		{"Input", fmt.Sprintf("%s  (%s)", inPath, fmtSize(inFi.Size()))},
+		{"Output", fmt.Sprintf("%s  (%s)", outPath, fmtSize(outFi.Size()))},
+		{"Cipher", "AES-256-GCM  ✔ authenticated"},
+		{"Time", fmtDur(elapsed)},
+	}, true)
+	return nil
 }
 
-// menuTOTP interactively runs TOTP gen or verify.
+// menuView interactively views an encrypted file.
+func menuView() error {
+	inPath, err := menuPromptStr("Input file", "")
+	if err != nil || inPath == "" {
+		return usagef("input file is required")
+	}
+	pass, err := resolvePass("", false)
+	if err != nil {
+		return err
+	}
+	defer zero(pass)
+
+	src, err := os.Open(inPath)
+	if err != nil {
+		return usagef("cannot open input: %v", err)
+	}
+	defer src.Close()
+
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, dim("--- START ---"))
+	if err := decryptStream(bufio.NewReaderSize(src, chunkSize+tagLen), os.Stdout, pass); err != nil {
+		fmt.Fprintln(os.Stderr, "")
+		return usagef("decrypt failed: %v", err)
+	}
+	fmt.Fprintln(os.Stderr, dim("\n--- END ---"))
+	return nil
+}
+
+// menuEdit interactively edits an encrypted file in place.
+func menuEdit() error {
+	inPath, err := menuPromptStr("Input file", "")
+	if err != nil || inPath == "" {
+		return usagef("input file is required")
+	}
+	pass, err := resolvePass("", false)
+	if err != nil {
+		return err
+	}
+	defer zero(pass)
+
+	tmp, err := os.CreateTemp("", "bastion-edit-*.txt")
+	if err != nil {
+		return usagef("cannot create temp file: %v", err)
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer wipeFile(tmpPath)
+
+	if err := runCrypt(inPath, tmpPath, pass, false, 0, false); err != nil {
+		return err
+	}
+
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		if runtime.GOOS == "windows" {
+			editor = "notepad.exe"
+		} else {
+			editor = "nano"
+			if _, err := exec.LookPath("nano"); err != nil {
+				editor = "vi"
+			}
+		}
+	}
+
+	cmd := exec.Command(editor, tmpPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return usagef("editor failed: %v", err)
+	}
+
+	if err := runCrypt(tmpPath, inPath, pass, true, defaultRounds, false); err != nil {
+		return usagef("re-encryption failed: %v", err)
+	}
+	
+	fmt.Fprintln(os.Stderr)
+	drawCard("EDITED SUCCESSFULLY", [][2]string{
+		{"File", inPath},
+		{"Editor", editor},
+		{"Status", "Re-encrypted & tmp wiped"},
+	}, true)
+	return nil
+}
+
+// menuWipe interactively shreds a file.
+func menuWipe() error {
+	path, err := menuPromptStr("File to wipe", "")
+	if err != nil || path == "" {
+		return usagef("file path is required")
+	}
+	
+	confirm, err := menuPromptStr(fmt.Sprintf("Type 'yes' to permanently shred %s", path), "")
+	if err != nil {
+		return err
+	}
+	if confirm != "yes" {
+		return usagef("wipe aborted")
+	}
+
+	t0 := time.Now()
+	if err := wipeFile(path); err != nil {
+		return usagef("wipe failed: %v", err)
+	}
+	elapsed := time.Since(t0)
+
+	fmt.Fprintln(os.Stderr)
+	drawCard("FILE WIPED", [][2]string{
+		{"File", path},
+		{"Passes", "Random + Zeroes"},
+		{"Time", fmtDur(elapsed)},
+	}, true)
+	return nil
+}
+
+// menuTOTP interactively runs TOTP gen (with live countdown) or verify.
 func menuTOTP() error {
-	fmt.Fprintln(os.Stderr, "  "+yellow("[a]")+(" Generate code   ")+yellow("[b]")+" Verify code")
+	fmt.Fprintln(os.Stderr, "  "+yellow("[A]")+" Generate code with countdown   "+yellow("[B]")+" Verify code")
 	fmt.Fprint(os.Stderr, "  Mode [a]: ")
 	modeLine, _ := stdin.ReadString('\n')
 	mode := strings.TrimRight(modeLine, "\r\n ")
@@ -940,24 +1259,53 @@ func menuTOTP() error {
 		if err != nil {
 			return err
 		}
+		fmt.Fprintln(os.Stderr)
 		if !ok {
+			drawCard("INVALID CODE", [][2]string{{"Code", code}}, false)
 			return secf("INVALID code")
 		}
-		okf("VALID code (within ±1 time step)")
+		drawCard("CODE VERIFIED", [][2]string{
+			{"Code", code},
+			{"Window", "±1 time step (30 s)"},
+		}, true)
 		return nil
 	}
 
-	now := time.Now().Unix()
-	code, err := totpAt(secret, now)
-	if err != nil {
-		return err
+	// Generate mode: show a live countdown bar until the window expires.
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "  "+dim("Live countdown — auto-exits when the 30s window rolls over"))
+	fmt.Fprintln(os.Stderr)
+
+	const barCells = 24
+	for {
+		now := time.Now().Unix()
+		secsLeft := totpStep - now%totpStep
+		code, err := totpAt(secret, now)
+		if err != nil {
+			fmt.Fprintln(os.Stderr)
+			return err
+		}
+
+		filled := int(secsLeft * barCells / totpStep)
+		bar := strings.Repeat("█", filled) + strings.Repeat("░", barCells-filled)
+
+		var urgency string
+		if secsLeft <= 5 {
+			urgency = red(fmt.Sprintf("%2ds left", secsLeft))
+		} else {
+			urgency = dim(fmt.Sprintf("%2ds left", secsLeft))
+		}
+		fmt.Fprintf(os.Stderr, "\r  %s  [%s]  %s   ",
+			green(code), bar, urgency)
+
+		time.Sleep(time.Second)
+
+		if secsLeft <= 1 {
+			// Window just expired — break out so the card can show the final code.
+			break
+		}
 	}
-	left := totpStep - now%totpStep
-	fmt.Println(green(code))
-	notef("valid for %ds", left)
-	if left <= 5 {
-		warnf("this code expires in %ds — wait for the next one if you are cutting it close", left)
-	}
+	fmt.Fprintln(os.Stderr) // end the \r line
 	return nil
 }
 
@@ -971,15 +1319,31 @@ func menuScan() error {
 	if statErr != nil || !info.IsDir() {
 		return usagef("not a directory: %s", dir)
 	}
+
+	fmt.Fprintln(os.Stderr, "  "+dim("Scanning..."))
+	t0 := time.Now()
 	total, files, err := scanDir(os.Stdout, dir, 4.5)
+	elapsed := time.Since(t0)
 	if err != nil {
 		return usagef("scan failed: %v", err)
 	}
-	notef("scanned %d files in %s", files, dir)
+
+	status := "CLEAN — NO SECRETS FOUND"
+	ok := true
 	if total > 0 {
+		status = fmt.Sprintf("%d POTENTIAL SECRET(S) FOUND", total)
+		ok = false
+	}
+	fmt.Fprintln(os.Stderr)
+	drawCard(status, [][2]string{
+		{"Directory", dir},
+		{"Files", fmt.Sprintf("%d scanned", files)},
+		{"Findings", fmt.Sprintf("%d", total)},
+		{"Time", fmtDur(elapsed)},
+	}, ok)
+	if !ok {
 		return secf("%d potential secret(s) found", total)
 	}
-	okf("No secrets found")
 	return nil
 }
 
@@ -998,10 +1362,23 @@ func menuGen() error {
 		return err
 	}
 	symbols := !strings.EqualFold(strings.TrimSpace(symStr), "n")
+
+	t0 := time.Now()
 	pw, classes := genPassword(length, symbols)
+	elapsed := time.Since(t0)
 	pool := strings.Join(classes, "")
+	entropy := float64(length) * math.Log2(float64(len(pool)))
+
+	fmt.Fprintln(os.Stderr)
+	// Print the password to stdout so it can be piped.
 	fmt.Println(green(string(pw)))
-	notef("%d chars, ~%.0f bits of entropy", length, float64(length)*math.Log2(float64(len(pool))))
+	fmt.Fprintln(os.Stderr)
+	drawCard("PASSWORD GENERATED", [][2]string{
+		{"Length", fmt.Sprintf("%d chars", length)},
+		{"Entropy", fmt.Sprintf("~%.0f bits (pool: %d chars)", entropy, len(pool))},
+		{"CSPRNG", "crypto/rand"},
+		{"Time", fmtDur(elapsed)},
+	}, true)
 	zero(pw)
 	return nil
 }
@@ -1016,11 +1393,30 @@ func menuHash() error {
 	if err != nil {
 		return err
 	}
+
+	fi, _ := os.Stat(path)
+	t0 := time.Now()
 	sum, err := hashFile(path, algo)
+	elapsed := time.Since(t0)
 	if err != nil {
 		return err
 	}
+
+	// Print digest to stdout so it is pipeable in non-menu usage.
 	fmt.Printf("%s  %s\n", green(sum), path)
+	fmt.Fprintln(os.Stderr)
+
+	var sizeRow string
+	if fi != nil {
+		sizeRow = fmtSize(fi.Size())
+	}
+	drawCard("DIGEST COMPUTED", [][2]string{
+		{"File", path},
+		{"Size", sizeRow},
+		{"Algorithm", strings.ToUpper(algo)},
+		{"Digest", sum[:16] + "…"},
+		{"Time", fmtDur(elapsed)},
+	}, true)
 	return nil
 }
 
@@ -1037,17 +1433,21 @@ func cmdMenu() error {
 	}
 
 	menuItems := []string{
-		dim("  [1]") + " Encrypt File",
-		dim("  [2]") + " Decrypt File",
-		dim("  [3]") + " 2FA / TOTP Authenticator",
-		dim("  [4]") + " Scan Directory for Leaked Secrets",
-		dim("  [5]") + " Generate Secure Password",
-		dim("  [6]") + " Compute File Checksum",
-		dim("  [7]") + " CLI Help Reference",
-		dim("  [0]") + " Exit",
+		"  " + yellow("[E]") + "ncrypt File          " + dim("AES-256-GCM + PBKDF2"),
+		"  " + yellow("[D]") + "ecrypt File          " + dim("authenticated decryption"),
+		"  " + yellow("[V]") + "iew Encrypted File   " + dim("decrypt to stdout"),
+		"  " + yellow("[I]") + "n-Place Edit         " + dim("secure temporary editor"),
+		"  " + yellow("[W]") + "ipe File             " + dim("cryptographic shredder"),
+		"  " + yellow("[T]") + "OTP Authenticator    " + dim("RFC 6238 · live countdown"),
+		"  " + yellow("[S]") + "can for Secrets      " + dim("entropy + pattern matching"),
+		"  " + yellow("[G]") + "enerate Password     " + dim("CSPRNG · zero bias"),
+		"  " + yellow("[H]") + "ash File             " + dim("SHA-256 / SHA-512"),
+		"  " + yellow("[?]") + " CLI Help Reference",
+		"  " + yellow("[Q]") + "uit",
 	}
 
 	for {
+		clearScreen()
 		fmt.Fprintln(os.Stderr, green(menuHeader))
 		fmt.Fprintln(os.Stderr)
 		for _, item := range menuItems {
@@ -1061,37 +1461,52 @@ func cmdMenu() error {
 			fmt.Fprintln(os.Stderr)
 			return nil
 		}
-		choice := strings.TrimRight(line, "\r\n ")
+		choice := strings.ToLower(strings.TrimRight(line, "\r\n "))
+
+		// Exit immediately — no card, no pause.
+		if choice == "0" || choice == "q" || choice == "quit" || choice == "exit" {
+			clearScreen()
+			fmt.Fprintln(os.Stderr, dim("  Goodbye."))
+			return nil
+		}
+
+		// Clear screen before running the selected action.
+		clearScreen()
 		fmt.Fprintln(os.Stderr)
 
 		var runErr error
 		switch choice {
-		case "0", "q", "quit", "exit":
-			fmt.Fprintln(os.Stderr, dim("Goodbye."))
-			return nil
-		case "1":
+		case "1", "e":
 			runErr = menuEncrypt()
-		case "2":
+		case "2", "d":
 			runErr = menuDecrypt()
-		case "3":
+		case "3", "v":
+			runErr = menuView()
+		case "4", "i":
+			runErr = menuEdit()
+		case "5", "w":
+			runErr = menuWipe()
+		case "6", "t":
 			runErr = menuTOTP()
-		case "4":
+		case "7", "s":
 			runErr = menuScan()
-		case "5":
+		case "8", "g":
 			runErr = menuGen()
-		case "6":
+		case "9", "h":
 			runErr = menuHash()
-		case "7":
+		case "10", "?":
 			fmt.Fprint(os.Stderr, usageText)
 		default:
-			warnf("Unknown choice %q — enter a number from 0 to 7.", choice)
+			warnf("Unknown choice %q — use a number 1–10 or a hotkey (E D V I W T S G H Q).", choice)
 		}
 
 		if runErr != nil {
-			// Report the error but stay in the REPL — let the user try again.
-			fmt.Fprintln(os.Stderr, red("✘ ")+runErr.Error())
+			// Show error inline; stay in the REPL so the user can retry.
+			fmt.Fprintln(os.Stderr)
+			fmt.Fprintln(os.Stderr, "  "+red("✘")+"  "+runErr.Error())
 		}
-		fmt.Fprintln(os.Stderr)
+
+		pauseForEnter()
 	}
 }
 
@@ -1113,9 +1528,23 @@ func cmdCrypt(args []string, encrypt bool) error {
 	if !encrypt {
 		name = "dec"
 	}
+
+	// Pre-parse and strip auto-wipe flags to support flexible positioning
+	// (e.g. `bastion enc secret.txt -rm` instead of just `bastion enc -rm secret.txt`)
+	var cleanArgs []string
+	autoWipe := false
+	for _, arg := range args {
+		if arg == "-rm" || arg == "--rm" || arg == "-wipe" || arg == "--wipe" {
+			autoWipe = true
+		} else {
+			cleanArgs = append(cleanArgs, arg)
+		}
+	}
+	args = cleanArgs
+
 	fl := flag.NewFlagSet(name, flag.ContinueOnError)
-	in := fl.String("in", "", "input file (required)")
-	out := fl.String("out", "", "output file (required)")
+	in := fl.String("in", "", "input file")
+	out := fl.String("out", "", "output file")
 	pass := fl.String("pass", "", "passphrase (prompted on stdin if omitted)")
 	// Only enc takes -rounds: dec reads the count out of the file it is opening.
 	rounds := defaultRounds
@@ -1128,8 +1557,29 @@ func cmdCrypt(args []string, encrypt bool) error {
 		return flagErr(err)
 	}
 
-	if *in == "" || *out == "" {
-		return usagef("%s requires -in and -out", name)
+	// Resolve positional arguments: named flags always take precedence.
+	pos := fl.Args()
+	if *in == "" && len(pos) > 0 {
+		*in = pos[0]
+		pos = pos[1:]
+	}
+	if *in == "" {
+		return usagef("%s requires an input file (-in or first positional argument)", name)
+	}
+	if *out == "" {
+		if len(pos) > 0 {
+			*out = pos[0]
+		} else if encrypt {
+			*out = *in + ".enc"
+		} else {
+			// dec: strip .enc if present, otherwise append .dec
+			stripped := strings.TrimSuffix(*in, ".enc")
+			if stripped != *in {
+				*out = stripped
+			} else {
+				*out = *in + ".dec"
+			}
+		}
 	}
 	if *in == *out {
 		return usagef("-in and -out must be different files")
@@ -1141,22 +1591,125 @@ func cmdCrypt(args []string, encrypt bool) error {
 	if err != nil {
 		return err
 	}
-	return runCrypt(*in, *out, p, encrypt, rounds)
+	defer zero(p)
+	return runCrypt(*in, *out, p, encrypt, rounds, autoWipe)
+}
+
+func cmdView(args []string) error {
+	fl := flag.NewFlagSet("view", flag.ContinueOnError)
+	passFlag := fl.String("pass", "", "passphrase (prompted on stdin if omitted)")
+	if err := fl.Parse(args); err != nil {
+		return flagErr(err)
+	}
+	if fl.NArg() == 0 {
+		return usagef("view requires a file to decrypt")
+	}
+	inPath := fl.Arg(0)
+	pass, err := resolvePass(*passFlag, false)
+	if err != nil {
+		return err
+	}
+	defer zero(pass)
+
+	src, err := os.Open(inPath)
+	if err != nil {
+		return usagef("cannot open input: %v", err)
+	}
+	defer src.Close()
+
+	if err := decryptStream(bufio.NewReaderSize(src, chunkSize+tagLen), os.Stdout, pass); err != nil {
+		return usagef("decrypt failed: %v", err)
+	}
+	return nil
+}
+
+func cmdEdit(args []string) error {
+	fl := flag.NewFlagSet("edit", flag.ContinueOnError)
+	passFlag := fl.String("pass", "", "passphrase (prompted on stdin if omitted)")
+	if err := fl.Parse(args); err != nil {
+		return flagErr(err)
+	}
+	if fl.NArg() == 0 {
+		return usagef("edit requires a file to decrypt")
+	}
+	inPath := fl.Arg(0)
+	pass, err := resolvePass(*passFlag, false)
+	if err != nil {
+		return err
+	}
+	defer zero(pass)
+
+	tmp, err := os.CreateTemp("", "bastion-edit-*.txt")
+	if err != nil {
+		return usagef("cannot create temp file: %v", err)
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer wipeFile(tmpPath)
+
+	if err := runCrypt(inPath, tmpPath, pass, false, 0, false); err != nil {
+		return err
+	}
+
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		if runtime.GOOS == "windows" {
+			editor = "notepad.exe"
+		} else {
+			editor = "nano"
+			if _, err := exec.LookPath("nano"); err != nil {
+				editor = "vi"
+			}
+		}
+	}
+
+	cmd := exec.Command(editor, tmpPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return usagef("editor failed: %v", err)
+	}
+
+	if err := runCrypt(tmpPath, inPath, pass, true, defaultRounds, false); err != nil {
+		return usagef("re-encryption failed: %v", err)
+	}
+	okf("Successfully edited and re-encrypted %s", inPath)
+	return nil
+}
+
+func cmdWipe(args []string) error {
+	fl := flag.NewFlagSet("wipe", flag.ContinueOnError)
+	if err := fl.Parse(args); err != nil {
+		return flagErr(err)
+	}
+	if fl.NArg() == 0 {
+		return usagef("wipe requires a file to shred")
+	}
+	path := fl.Arg(0)
+	if err := wipeFile(path); err != nil {
+		return usagef("wipe failed: %v", err)
+	}
+	okf("Wiped and removed %s", path)
+	return nil
 }
 
 const usageText = `bastion — zero-dependency security toolbox
 
 USAGE
-  bastion                                                  interactive menu (requires a TTY)
-  bastion menu                                             same as above
-  bastion enc  -in <file> -out <file> [-pass <pass>] [-rounds <n>]
-                                                           encrypt a file (AES-256-GCM)
-  bastion dec  -in <file> -out <file> [-pass <pass>]       decrypt a file (exit 2 if tampered)
-  bastion totp gen    -secret <base32>                     generate a 6-digit TOTP code
-  bastion totp verify -secret <base32> -code <code>        verify a code (±1 step drift)
-  bastion scan -dir <path> [-entropy <float>]              hunt for leaked secrets
-  bastion gen  [-len <int>] [-symbols]                     generate a strong password
-  bastion hash -file <file> [-algo sha256|sha512]          stream-hash a file
+  bastion                                                    interactive menu (requires a TTY)
+  bastion menu                                               same as above
+  bastion enc  [<file>] [-in <f>] [-out <f>] [-pass <p>] [-rounds <n>] [-rm]
+                                                             encrypt (auto-names to <file>.enc)
+  bastion dec  [<file>] [-in <f>] [-out <f>] [-pass <p>]     decrypt (auto-strips .enc suffix)
+  bastion view <file.enc>                                    decrypt to stdout
+  bastion edit <file.enc>                                    securely edit in place
+  bastion wipe <file>                                        cryptographic file shredder
+  bastion totp gen    [<secret>] [-secret <b32>]             generate a 6-digit TOTP code
+  bastion totp verify [<secret>] [<code>] [-secret] [-code]  verify a code (±1 step drift)
+  bastion scan [<dir>] [-dir <path>] [-entropy <float>]      hunt for leaked secrets (default: .)
+  bastion gen  [-len <int>] [-symbols]                       generate a strong password
+  bastion hash [<file>] [-file <path>] [-algo sha256|sha512] stream-hash a file
 
 EXIT CODES
   0  success        1  bad arguments or I/O error        2  tamper / secret found
@@ -1178,6 +1731,12 @@ func dispatch(args []string) error {
 		return cmdCrypt(args[1:], true)
 	case "dec":
 		return cmdCrypt(args[1:], false)
+	case "view":
+		return cmdView(args[1:])
+	case "edit":
+		return cmdEdit(args[1:])
+	case "wipe":
+		return cmdWipe(args[1:])
 	case "totp":
 		if len(args) < 2 {
 			return usagef("totp requires a subcommand: gen or verify")

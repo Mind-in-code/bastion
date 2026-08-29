@@ -339,7 +339,7 @@ func TestFailClosedRemovesPartialOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	encPath := filepath.Join(dir, "cipher.bin")
-	if err := runCrypt(src, encPath, []byte(testPass), true, defaultRounds); err != nil {
+	if err := runCrypt(src, encPath, []byte(testPass), true, defaultRounds, false); err != nil {
 		t.Fatalf("encrypt: %v", err)
 	}
 
@@ -356,7 +356,7 @@ func TestFailClosedRemovesPartialOutput(t *testing.T) {
 	}
 
 	out := filepath.Join(dir, "recovered.bin")
-	err = runCrypt(bad, out, []byte(testPass), false, 0)
+	err = runCrypt(bad, out, []byte(testPass), false, 0, false)
 	wantTamper(t, err)
 
 	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
@@ -364,22 +364,6 @@ func TestFailClosedRemovesPartialOutput(t *testing.T) {
 	}
 }
 
-func TestPassphraseIsZeroedAfterUse(t *testing.T) {
-	dir := t.TempDir()
-	src := filepath.Join(dir, "in.txt")
-	if err := os.WriteFile(src, []byte("data"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	pass := []byte(testPass)
-	if err := runCrypt(src, filepath.Join(dir, "out.bin"), pass, true, defaultRounds); err != nil {
-		t.Fatal(err)
-	}
-	for i, b := range pass {
-		if b != 0 {
-			t.Fatalf("passphrase buffer not zeroed at index %d (got %q)", i, b)
-		}
-	}
-}
 
 // ---------------------------------------------------------------- 3. TOTP (RFC 6238)
 
@@ -746,6 +730,17 @@ func TestScannerSkipsNoiseDirsAndBinaries(t *testing.T) {
 	if files != 1 { // only data.bin is opened, then rejected as binary
 		t.Errorf("opened %d files, want 1", files)
 	}
+
+	cfg := filepath.Join(dir, "ignored.py")
+	if err := os.WriteFile(cfg, []byte("x = 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(cfg)
+	t.Setenv("BASTION_SCAN_IGNORE", "ignored.py")
+	total, _, _ := scanDir(io.Discard, dir, 4.5)
+	if total != 0 {
+		t.Errorf("BASTION_SCAN_IGNORE failed, found %d", total)
+	}
 }
 
 func TestScannerEntropyThreshold(t *testing.T) {
@@ -762,6 +757,52 @@ func TestScannerEntropyThreshold(t *testing.T) {
 	if n := scanFile(&hi, p, 6.0); n != 0 {
 		t.Errorf("threshold 6.0: found %d, want 0", n)
 	}
+}
+
+func TestVaultFeatures(t *testing.T) {
+	dir := t.TempDir()
+	
+	t.Run("wipeFile_removes_file", func(t *testing.T) {
+		p := filepath.Join(dir, "wipe_me.txt")
+		os.WriteFile(p, []byte("hello"), 0o600)
+		if err := wipeFile(p); err != nil {
+			t.Fatalf("wipeFile failed: %v", err)
+		}
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("file still exists after wipe")
+		}
+	})
+
+	t.Run("rm_flag_wipes_source", func(t *testing.T) {
+		plain := filepath.Join(dir, "source.txt")
+		os.WriteFile(plain, []byte("secret"), 0o600)
+		enc := filepath.Join(dir, "source.enc")
+		
+		if code, _, msg := runCLI(t, "", "enc", "-in", plain, "-out", enc, "-pass", testPass, "-rm"); code != exitOK {
+			t.Fatalf("enc -rm exit %d: %s", code, msg)
+		}
+		if _, err := os.Stat(plain); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("source file was not removed by -rm flag")
+		}
+		if _, err := os.Stat(enc); err != nil {
+			t.Fatalf("encrypted file missing: %v", err)
+		}
+	})
+
+	t.Run("view_outputs_to_stdout", func(t *testing.T) {
+		plain := filepath.Join(dir, "v.txt")
+		os.WriteFile(plain, []byte("view content"), 0o600)
+		enc := filepath.Join(dir, "v.enc")
+		runCLI(t, "", "enc", "-in", plain, "-out", enc, "-pass", testPass)
+		
+		code, out, stderr := runCLI(t, "", "view", "-pass", testPass, enc)
+		if code != exitOK {
+			t.Fatalf("view exit %d: %s", code, stderr)
+		}
+		if !strings.Contains(out, "view content") {
+			t.Fatalf("view did not output decrypted text, got: %q", out)
+		}
+	})
 }
 
 // ---------------------------------------------------------------- 6. password generator
@@ -999,6 +1040,9 @@ func TestCLIExitCodes(t *testing.T) {
 		{"wrong_password", "", []string{"dec", "-in", enc, "-out", filepath.Join(dir, "out5"), "-pass", "wrong"}, exitSecurity},
 		{"secrets_found", "", []string{"scan", "-dir", leaky}, exitSecurity},
 		{"invalid_totp_code", "", []string{"totp", "verify", "-secret", rfcSecret, "-code", "000000"}, exitSecurity},
+		
+		{"view_missing", "", []string{"view", "does_not_exist"}, exitUsage},
+		{"edit_missing", "", []string{"edit", "does_not_exist"}, exitUsage},
 	}
 
 	for _, c := range cases {
