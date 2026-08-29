@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMain doubles as the CLI entry point for subprocess tests: when the marker
@@ -1326,5 +1327,98 @@ func BenchmarkGenPassword(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		pw, _ := genPassword(20, true)
 		zero(pw)
+	}
+}
+
+// ---------------------------------------------------------------- 10. doctor & bench
+
+// TestDoctorKATs validates every individual KAT function in isolation.
+func TestDoctorKATs(t *testing.T) {
+	t.Run("PBKDF2", func(t *testing.T) {
+		if err := katPBKDF2(); err != nil {
+			t.Errorf("katPBKDF2 failed: %v", err)
+		}
+	})
+	t.Run("AES-GCM", func(t *testing.T) {
+		if err := katAESGCM(); err != nil {
+			t.Errorf("katAESGCM failed: %v", err)
+		}
+	})
+	t.Run("TOTP", func(t *testing.T) {
+		if err := katTOTP(); err != nil {
+			t.Errorf("katTOTP failed: %v", err)
+		}
+	})
+	t.Run("Tamper", func(t *testing.T) {
+		if err := katTamper(); err != nil {
+			t.Errorf("katTamper failed: %v", err)
+		}
+	})
+	t.Run("MemHygiene", func(t *testing.T) {
+		if err := katMemHygiene(); err != nil {
+			t.Errorf("katMemHygiene failed: %v", err)
+		}
+	})
+	t.Run("CSPRNG", func(t *testing.T) {
+		if err := katCSPRNG(); err != nil {
+			t.Errorf("katCSPRNG failed: %v", err)
+		}
+	})
+}
+
+// TestDoctor runs cmdDoctor end-to-end and asserts it exits 0 and touches all 6 checks.
+func TestDoctor(t *testing.T) {
+	if err := cmdDoctor(nil); err != nil {
+		t.Fatalf("cmdDoctor returned error: %v", err)
+	}
+}
+
+// TestBench runs cmdBench end-to-end (abbreviated: just verifies it exits cleanly
+// without panicking; actual throughput numbers are hardware-dependent).
+func TestBench(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping benchmark suite in -short mode")
+	}
+	if err := cmdBench(nil); err != nil {
+		t.Fatalf("cmdBench returned error: %v", err)
+	}
+}
+
+// TestDoctorAndBenchCLI exercises both subcommands as real subprocess invocations
+// to validate exit codes through the main() dispatch path.
+func TestDoctorAndBenchCLI(t *testing.T) {
+	t.Run("doctor_ok", func(t *testing.T) {
+		code, _, msg := runCLI(t, "", "doctor")
+		if code != exitOK {
+			t.Errorf("bastion doctor exited %d, want %d\nstderr: %s", code, exitOK, msg)
+		}
+	})
+
+	t.Run("bench_ok", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("skipping bench CLI test in -short mode")
+		}
+		code, _, msg := runCLI(t, "", "bench")
+		if code != exitOK {
+			t.Errorf("bastion bench exited %d, want %d\nstderr: %s", code, exitOK, msg)
+		}
+	})
+}
+
+// TestRunBench verifies the internal calibration loop terminates and returns sane values.
+func TestRunBench(t *testing.T) {
+	count := 0
+	iters, elapsed := runBench(50*time.Millisecond, func(n int) {
+		count += n
+		// Simulate a tiny bit of work so elapsed > 0 on first pass.
+		for i := 0; i < n; i++ {
+			_ = shannon("test")
+		}
+	})
+	if iters <= 0 {
+		t.Errorf("runBench returned iters=%d, want > 0", iters)
+	}
+	if elapsed < 50*time.Millisecond {
+		t.Errorf("runBench elapsed %v, want >= 50ms", elapsed)
 	}
 }

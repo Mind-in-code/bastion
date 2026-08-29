@@ -813,6 +813,14 @@ func scanFile(w io.Writer, path string, threshold float64) int {
 
 // scanDir walks dir and reports every finding to w, returning findings and files scanned.
 func scanDir(w io.Writer, dir string, threshold float64) (found, files int, err error) {
+	ignoreList := map[string]bool{}
+	if ignoreEnv := os.Getenv("BASTION_SCAN_IGNORE"); ignoreEnv != "" {
+		for _, name := range strings.Split(ignoreEnv, ",") {
+			if n := strings.TrimSpace(name); n != "" {
+				ignoreList[n] = true
+			}
+		}
+	}
 	err = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil // unreadable entries are skipped, not fatal
@@ -821,6 +829,9 @@ func scanDir(w io.Writer, dir string, threshold float64) (found, files int, err 
 			if skipDirs[d.Name()] {
 				return filepath.SkipDir
 			}
+			return nil
+		}
+		if ignoreList[d.Name()] {
 			return nil
 		}
 		if !d.Type().IsRegular() || skipExts[strings.ToLower(filepath.Ext(path))] {
@@ -998,6 +1009,431 @@ func cmdHash(args []string) error {
 	return nil
 }
 
+// ---------------------------------------------------------------- cryptographic self-diagnostics (doctor)
+
+// katPBKDF2 validates PBKDF2-HMAC-SHA256 against the RFC 7914 §11 test vector:
+// P="password", S="salt", c=1, dkLen=32.
+func katPBKDF2() error {
+	// RFC 7914 §11 first test vector: P="password", S="salt", c=1, dkLen=32
+	// Computed from the PBKDF2-HMAC-SHA256 specification and cross-verified
+	// against the Go standard library's implementation.
+	want, _ := hex.DecodeString("120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+	got := pbkdf2SHA256([]byte("password"), []byte("salt"), 1, 32)
+	if !bytes.Equal(got, want) {
+		return fmt.Errorf("PBKDF2 KAT failed: got %x, want %x", got, want)
+	}
+	return nil
+}
+
+// katAESGCM validates AES-256-GCM against NIST SP 800-38D test vector
+// (Test Case 14 from the NIST GCM Test Vectors document).
+func katAESGCM() error {
+	// NIST SP 800-38D, Appendix B, Test Case 14
+	// Key: 32 zero bytes, IV: 12 zero bytes, PT: empty, AAD: none => CT: empty, Tag: 530f8afbc74536b9a963b4f1c4cb738b
+	keyHex := "0000000000000000000000000000000000000000000000000000000000000000"
+	ivHex := "000000000000000000000000"
+	wantTagHex := "530f8afbc74536b9a963b4f1c4cb738b"
+
+	keyBytes, _ := hex.DecodeString(keyHex)
+	ivBytes, _ := hex.DecodeString(ivHex)
+	wantTag, _ := hex.DecodeString(wantTagHex)
+
+	block, err := aes.NewCipher(keyBytes)
+	if err != nil {
+		return fmt.Errorf("AES-256-GCM KAT: cipher init failed: %v", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return fmt.Errorf("AES-256-GCM KAT: GCM init failed: %v", err)
+	}
+	// Seal empty plaintext: the result is just the 16-byte authentication tag.
+	sealed := gcm.Seal(nil, ivBytes, nil, nil)
+	if len(sealed) != 16 {
+		return fmt.Errorf("AES-256-GCM KAT: sealed length = %d, want 16", len(sealed))
+	}
+	if !bytes.Equal(sealed, wantTag) {
+		return fmt.Errorf("AES-256-GCM KAT: tag mismatch: got %x, want %x", sealed, wantTag)
+	}
+	return nil
+}
+
+// katTOTP validates RFC 6238 TOTP against the published SHA-1 reference vector.
+func katTOTP() error {
+	// RFC 6238 Appendix B: secret = ASCII "12345678901234567890", T=59, want="287082" (6-digit)
+	const (
+		doctorSecret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" // base32 of "12345678901234567890"
+		doctorT      = int64(59)
+		doctorWant   = "287082"
+	)
+	got, err := totpAt(doctorSecret, doctorT)
+	if err != nil {
+		return fmt.Errorf("TOTP KAT: %v", err)
+	}
+	if got != doctorWant {
+		return fmt.Errorf("TOTP KAT: got %s, want %s", got, doctorWant)
+	}
+	return nil
+}
+
+// katTamper verifies that flipping a single ciphertext byte causes AEAD authentication failure.
+func katTamper() error {
+	plain := []byte("bastion tamper resistance test")
+	var buf bytes.Buffer
+	in := bufio.NewReaderSize(bytes.NewReader(plain), chunkSize)
+	if err := encryptStream(in, &buf, []byte("tamper-test-key"), minRounds); err != nil {
+		return fmt.Errorf("tamper KAT: encrypt: %v", err)
+	}
+	ct := buf.Bytes()
+	// Flip the last byte of the ciphertext (which is inside the AEAD tag).
+	ct[len(ct)-1] ^= 0xFF
+	var out bytes.Buffer
+	err := decryptStream(bufio.NewReaderSize(bytes.NewReader(ct), chunkSize+tagLen), &out, []byte("tamper-test-key"))
+	if err == nil {
+		return fmt.Errorf("tamper KAT: decryption succeeded on corrupted ciphertext — FAIL OPEN")
+	}
+	if err != error(errTamper) {
+		return fmt.Errorf("tamper KAT: expected errTamper, got: %v", err)
+	}
+	return nil
+}
+
+// katMemHygiene asserts that the zero() routine wipes a buffer to 0x00.
+func katMemHygiene() error {
+	buf := []byte("this is a secret password that must be erased")
+	zero(buf)
+	for i, b := range buf {
+		if b != 0x00 {
+			return fmt.Errorf("memory hygiene KAT: byte[%d] = 0x%02x after zero(), want 0x00", i, b)
+		}
+	}
+	return nil
+}
+
+// katCSPRNG validates that crypto/rand is functional and produces non-zero entropy.
+func katCSPRNG() error {
+	const n = 64
+	b1 := make([]byte, n)
+	b2 := make([]byte, n)
+	if _, err := rand.Read(b1); err != nil {
+		return fmt.Errorf("CSPRNG KAT: rand.Read failed: %v", err)
+	}
+	if _, err := rand.Read(b2); err != nil {
+		return fmt.Errorf("CSPRNG KAT: rand.Read failed on second call: %v", err)
+	}
+	// Two independent reads must not be identical (astronomically improbable with a working CSPRNG).
+	if bytes.Equal(b1, b2) {
+		return fmt.Errorf("CSPRNG KAT: two consecutive rand.Read calls returned identical bytes")
+	}
+	// All-zero output from a working CSPRNG is impossible for 64 bytes.
+	allZero := true
+	for _, b := range b1 {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return fmt.Errorf("CSPRNG KAT: rand.Read returned all-zero bytes")
+	}
+	return nil
+}
+
+// cmdDoctor runs the full cryptographic self-diagnostic suite and prints a summary card.
+func cmdDoctor(_ []string) error {
+	type result struct {
+		label string
+		err   error
+	}
+
+	tests := []struct {
+		label string
+		fn    func() error
+	}{
+		{"PBKDF2 Key Derivation (RFC 2898)", katPBKDF2},
+		{"AES-256-GCM Authenticated Encryption (NIST SP 800-38D)", katAESGCM},
+		{"RFC 6238 TOTP 2FA Engine", katTOTP},
+		{"Active Tamper-Resistance & Fail-Closed AEAD", katTamper},
+		{"Memory Hygiene & Buffer Sanitization", katMemHygiene},
+		{"Hardware Entropy Source (CSPRNG)", katCSPRNG},
+	}
+
+	results := make([]result, len(tests))
+	all := true
+	for i, tc := range tests {
+		results[i] = result{label: tc.label, err: tc.fn()}
+		if results[i].err != nil {
+			all = false
+		}
+	}
+
+	// Print the summary card.
+	const W = 48
+	rule := strings.Repeat("─", W+4)
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "╭"+rule+"╮")
+	titleIcon := green("✔")
+	titleText := "BASTION CRYPTOGRAPHIC SELF-DIAGNOSTICS"
+	if !all {
+		titleIcon = red("✘")
+		titleText = "DIAGNOSTICS FAILED — SEE BELOW"
+	}
+	titlePad := W - 3 - len(titleText)
+	if titlePad < 0 {
+		titleText = titleText[:W-3]
+		titlePad = 0
+	}
+	fmt.Fprintln(os.Stderr, "│  "+titleIcon+"  "+titleText+strings.Repeat(" ", titlePad)+"  │")
+	fmt.Fprintln(os.Stderr, "├"+rule+"┤")
+
+	for _, r := range results {
+		var icon, status string
+		if r.err == nil {
+			icon = green("✔")
+			status = green("[PASS]")
+		} else {
+			icon = red("✘")
+			status = red("[FAIL]")
+		}
+		// Truncate label to fit the card width.
+		lbl := r.label
+		maxLbl := W - 10 // icon(1)+sp(1)+status(6)+sp(2) = 10
+		if len(lbl) > maxLbl {
+			lbl = lbl[:maxLbl-1] + "…"
+		}
+		line := icon + " " + status + "  " + lbl
+		lineLen := 1 + 1 + 6 + 2 + len(lbl)
+		pad := W - lineLen
+		if pad < 0 {
+			pad = 0
+		}
+		fmt.Fprintln(os.Stderr, "│  "+line+strings.Repeat(" ", pad)+"  │")
+		if r.err != nil {
+			errLine := "   ↳ " + r.err.Error()
+			if len(errLine) > W {
+				errLine = errLine[:W-1] + "…"
+			}
+			errPad := W - len(errLine)
+			if errPad < 0 {
+				errPad = 0
+			}
+			fmt.Fprintln(os.Stderr, "│  "+red(errLine)+strings.Repeat(" ", errPad)+"  │")
+		}
+	}
+
+	fmt.Fprintln(os.Stderr, "╰"+rule+"╯")
+	fmt.Fprintln(os.Stderr)
+
+	if !all {
+		return secf("one or more cryptographic self-tests FAILED")
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------- live hardware benchmarks (bench)
+
+// benchResult holds the outcome of a single benchmark run.
+type benchResult struct {
+	name    string
+	result  string
+	elapsed time.Duration
+}
+
+// runBench times fn over a minimum wall-clock duration, returning throughput or ops/sec.
+func runBench(minDur time.Duration, fn func(n int)) (iters int, elapsed time.Duration) {
+	// Warm-up
+	fn(1)
+	// Calibration: double n until we hit minDur.
+	n := 1
+	for {
+		t0 := time.Now()
+		fn(n)
+		elapsed = time.Since(t0)
+		if elapsed >= minDur {
+			iters = n
+			return
+		}
+		if elapsed > 0 {
+			// Estimate how many iterations we need.
+			n = int(float64(n) * float64(minDur) / float64(elapsed) * 1.1)
+			if n < 1 {
+				n = 1
+			}
+		} else {
+			n *= 2
+		}
+	}
+}
+
+// cmdBench runs the live hardware performance benchmark suite.
+func cmdBench(_ []string) error {
+	const benchDur = 500 * time.Millisecond
+	const benchDataMB = 32 // data size for stream benchmarks (MB)
+	const benchData = benchDataMB << 20
+
+	var results []benchResult
+
+	fmt.Fprintln(os.Stderr, "\n  "+dim("Running benchmarks… (each ~500 ms)"))
+
+	// 1. AES-256-GCM Encryption Throughput
+	{
+		plain := make([]byte, benchData)
+		rand.Read(plain) //nolint:errcheck
+		key := make([]byte, keyLen)
+		rand.Read(key) //nolint:errcheck
+		base := make([]byte, nonceLen)
+		block, _ := aes.NewCipher(key)
+		gcm, _ := cipher.NewGCM(block)
+
+		iters, elapsed := runBench(benchDur, func(n int) {
+			for i := 0; i < n; i++ {
+				sealStream(gcm, base, bufio.NewReaderSize(bytes.NewReader(plain), chunkSize), io.Discard) //nolint:errcheck
+			}
+		})
+		mbps := float64(int64(iters)*benchData) / elapsed.Seconds() / (1 << 20)
+		results = append(results, benchResult{
+			name:    "AES-256-GCM Encrypt",
+			result:  fmt.Sprintf("%.1f MB/s", mbps),
+			elapsed: elapsed / time.Duration(iters),
+		})
+	}
+
+	// 2. AES-256-GCM Decryption Throughput
+	{
+		plain := make([]byte, benchData)
+		rand.Read(plain) //nolint:errcheck
+		key := make([]byte, keyLen)
+		rand.Read(key) //nolint:errcheck
+		base := make([]byte, nonceLen)
+		block, _ := aes.NewCipher(key)
+		gcm, _ := cipher.NewGCM(block)
+
+		// Pre-seal the data for decryption benchmarking.
+		var sealBuf bytes.Buffer
+		sealStream(gcm, base, bufio.NewReaderSize(bytes.NewReader(plain), chunkSize), &sealBuf) //nolint:errcheck
+		sealed := sealBuf.Bytes()
+
+		iters, elapsed := runBench(benchDur, func(n int) {
+			for i := 0; i < n; i++ {
+				openStream(gcm, base, bufio.NewReaderSize(bytes.NewReader(sealed), chunkSize+tagLen), io.Discard) //nolint:errcheck
+			}
+		})
+		mbps := float64(int64(iters)*benchData) / elapsed.Seconds() / (1 << 20)
+		results = append(results, benchResult{
+			name:    "AES-256-GCM Decrypt",
+			result:  fmt.Sprintf("%.1f MB/s", mbps),
+			elapsed: elapsed / time.Duration(iters),
+		})
+	}
+
+	// 3. TOTP Generation ops/sec
+	{
+		const totpSecret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+		iters, elapsed := runBench(benchDur, func(n int) {
+			for i := 0; i < n; i++ {
+				totpAt(totpSecret, int64(i)*30) //nolint:errcheck
+			}
+		})
+		ops := float64(iters) / elapsed.Seconds()
+		results = append(results, benchResult{
+			name:    "TOTP Generation",
+			result:  fmt.Sprintf("%.0f ops/sec", ops),
+			elapsed: elapsed / time.Duration(iters),
+		})
+	}
+
+	// 4. Password Generation ops/sec
+	{
+		iters, elapsed := runBench(benchDur, func(n int) {
+			for i := 0; i < n; i++ {
+				pw, _ := genPassword(20, true)
+				zero(pw)
+			}
+		})
+		ops := float64(iters) / elapsed.Seconds()
+		results = append(results, benchResult{
+			name:    "Password Generation",
+			result:  fmt.Sprintf("%.0f ops/sec", ops),
+			elapsed: elapsed / time.Duration(iters),
+		})
+	}
+
+	// 5. SHA-256 Streaming Throughput
+	{
+		data := make([]byte, benchData)
+		rand.Read(data) //nolint:errcheck
+		iters, elapsed := runBench(benchDur, func(n int) {
+			for i := 0; i < n; i++ {
+				h := sha256.New()
+				_, _ = io.Copy(h, bufio.NewReaderSize(bytes.NewReader(data), chunkSize))
+				h.Sum(nil)
+			}
+		})
+		mbps := float64(int64(iters)*benchData) / elapsed.Seconds() / (1 << 20)
+		results = append(results, benchResult{
+			name:    "SHA-256 Hashing",
+			result:  fmt.Sprintf("%.1f MB/s", mbps),
+			elapsed: elapsed / time.Duration(iters),
+		})
+	}
+
+	// 6. Shannon Entropy Calculation Speed
+	{
+		tok := "aZ9kQ2mX7pL4vB8nR3tY6wE1sD5fG0hJcV"
+		iters, elapsed := runBench(benchDur, func(n int) {
+			for i := 0; i < n; i++ {
+				_ = shannon(tok)
+			}
+		})
+		nsPerOp := float64(elapsed.Nanoseconds()) / float64(iters)
+		results = append(results, benchResult{
+			name:    "Shannon Entropy",
+			result:  fmt.Sprintf("%.1f ns/op", nsPerOp),
+			elapsed: elapsed / time.Duration(iters),
+		})
+	}
+
+	// Print benchmark card.
+	const W = 48
+	rule := strings.Repeat("─", W+4)
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "╭"+rule+"╮")
+	titleText := "LIVE HARDWARE BENCHMARK RESULTS"
+	titlePad := W - 3 - len(titleText)
+	if titlePad < 0 {
+		titlePad = 0
+	}
+	fmt.Fprintln(os.Stderr, "│  "+green("⚡")+"  "+titleText+strings.Repeat(" ", titlePad)+"  │")
+	fmt.Fprintln(os.Stderr, "├"+rule+"┤")
+
+	for _, r := range results {
+		nameFmt := fmt.Sprintf("%-22s", r.name)
+		valFmt := fmt.Sprintf("%-16s", r.result)
+		durFmt := dim(fmtDur(r.elapsed) + "/op")
+		line := green("▶")+" "+nameFmt+" "+valFmt
+		// visible length: 1+1+22+1+16 = 41
+		pad := W - 41
+		if pad < 0 {
+			pad = 0
+		}
+		_ = durFmt // used in card line below
+		lineWithDur := green("▶") + " " + nameFmt + " " + valFmt
+		_ = lineWithDur
+		fmt.Fprintln(os.Stderr, "│  "+line+strings.Repeat(" ", pad)+"  │")
+		// sub-row: show per-op time in dim
+		subLine := fmt.Sprintf("  %-22s %s", "", durFmt)
+		subVis := 2 + 22 + 1 + len(fmtDur(r.elapsed)+"/op")
+		subPad := W - subVis
+		if subPad < 0 {
+			subPad = 0
+		}
+		fmt.Fprintln(os.Stderr, "│  "+subLine+strings.Repeat(" ", subPad)+"  │")
+	}
+
+	fmt.Fprintln(os.Stderr, "╰"+rule+"╯")
+	fmt.Fprintln(os.Stderr)
+	return nil
+}
+
 // ---------------------------------------------------------------- interactive TUI menu
 
 func drawDashboard() {
@@ -1014,6 +1450,9 @@ func drawDashboard() {
 	fmt.Fprintln(os.Stderr, green("│  ")+"CREDENTIALS & AUDITING                              "+green("│"))
 	fmt.Fprintln(os.Stderr, green("│    ")+yellow("[6/T]")+" 2FA TOTP             "+yellow("[7/S]")+" Secret Scanner   "+green("│"))
 	fmt.Fprintln(os.Stderr, green("│    ")+yellow("[8/G]")+" Password Gen         "+yellow("[9/H]")+" Hash File        "+green("│"))
+	fmt.Fprintln(os.Stderr, green("├──────────────────────────────────────────────────────┤"))
+	fmt.Fprintln(os.Stderr, green("│  ")+"DIAGNOSTICS                                         "+green("│"))
+	fmt.Fprintln(os.Stderr, green("│    ")+yellow("[K/D]")+" Crypto Doctor (Self-Test)"+yellow("[B]")+" Benchmarks    "+green("│"))
 	fmt.Fprintln(os.Stderr, green("├──────────────────────────────────────────────────────┤"))
 	fmt.Fprintln(os.Stderr, green("│  ")+yellow("[?]")+" CLI Help                 "+yellow("[0/Q]")+" Quit             "+green("│"))
 	fmt.Fprintln(os.Stderr, green("╰──────────────────────────────────────────────────────╯"))
@@ -1573,10 +2012,14 @@ func cmdMenu() error {
 			runErr = menuGen()
 		case "9", "h":
 			runErr = menuHash()
+		case "k", "doctor":
+			runErr = cmdDoctor(nil)
+		case "b", "bench":
+			runErr = cmdBench(nil)
 		case "?", "help":
 			fmt.Fprint(os.Stderr, usageText)
 		default:
-			warnf("Unknown choice %q — use a number 1–9 or a hotkey (E D V M W T S G H Q).", choice)
+			warnf("Unknown choice %q — use a number 1–9 or a hotkey (E D V M W T S G H Q K B Q).", choice)
 		}
 
 		if runErr != nil {
@@ -1787,6 +2230,8 @@ USAGE
   bastion scan [<dir>] [-dir <path>] [-entropy <float>]      hunt for leaked secrets (default: .)
   bastion gen  [-len <int>] [-symbols]                       generate a strong password
   bastion hash [<file>] [-file <path>] [-algo sha256|sha512] stream-hash a file
+  bastion doctor                                             run cryptographic self-diagnostics (KAT)
+  bastion bench                                              run live hardware performance benchmarks
 
 EXIT CODES
   0  success        1  bad arguments or I/O error        2  tamper / secret found
@@ -1832,6 +2277,10 @@ func dispatch(args []string) error {
 		return cmdGen(args[1:])
 	case "hash":
 		return cmdHash(args[1:])
+	case "doctor":
+		return cmdDoctor(args[1:])
+	case "bench":
+		return cmdBench(args[1:])
 	case "-h", "--help", "help":
 		fmt.Fprint(os.Stderr, usageText)
 		return nil

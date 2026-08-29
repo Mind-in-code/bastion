@@ -53,6 +53,17 @@ It features a rich Terminal User Interface (TUI) for interactive use, while rema
   bastion hash large-archive.zip -algo sha512
   ```
 
+### Diagnostics
+
+- **Cryptographic Doctor** (`bastion doctor`): Runs a full internal Known-Answer Test (KAT) suite directly inside the binary — no Go toolchain required. Validates PBKDF2 (RFC 2898), AES-256-GCM (NIST SP 800-38D), TOTP (RFC 6238), tamper-resistance (fail-closed AEAD), memory hygiene, and CSPRNG entropy. Renders a boxed ✔/✘ summary card.
+  ```bash
+  bastion doctor
+  ```
+- **Live Hardware Benchmarks** (`bastion bench`): Measures real AES-256-GCM encryption/decryption throughput (MB/s), TOTP and password generation (ops/sec), SHA-256 hashing (MB/s), and Shannon entropy speed (ns/op). Results display in a formatted benchmark card.
+  ```bash
+  bastion bench
+  ```
+
 ## Security Guarantees
 
 1. **Authentication First**: Decryption uses authenticated encryption (GCM). Any tampering (bit flips, truncation, chunk swaps) will result in a hard failure without leaking partial plaintext.
@@ -88,7 +99,9 @@ Commands:
   bastion scan [<dir>] [-dir <path>] [-entropy <float>]      hunt for leaked secrets (default: .)
   bastion gen  [-len <int>] [-symbols] [-copy]               generate a strong password
   bastion hash [<file>] [-file <path>] [-algo sha256|sha512] stream-hash a file
+  bastion doctor                                             run cryptographic self-diagnostics (KAT)
+  bastion bench                                              run live hardware performance benchmarks
 
 EXIT CODES
   0  success        1  bad arguments or I/O error        2  tamper / secret found
-```
+```

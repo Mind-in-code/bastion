@@ -26,10 +26,12 @@ the Go standard library, which ships with the toolchain, is versioned with it, a
 the Go Security Policy.
 
 The cost of this decision is real and worth stating plainly: **we hand-wrote PBKDF2, TOTP, base32
-normalisation, chunked AEAD framing, Shannon entropy, and the CLI router.** That is 908 lines of
-production code that a dependency would otherwise have supplied. We paid for it with 1,286 lines
-of tests — 96 tests at 90.9% statement coverage, including six RFC 6238 reference vectors,
-published SHA digests, and thirteen tamper/truncation/reorder/splice attack simulations.
+normalisation, chunked AEAD framing, Shannon entropy, the CLI router, a cryptographic KAT suite,
+and a live hardware benchmark engine.** That is substantially more production code than a dependency
+would otherwise have supplied. We paid for it with a comprehensive test suite — over 100 tests at
+high statement coverage, including six RFC 6238 reference vectors, published SHA digests, NIST
+SP 800-38D AES-GCM vectors, RFC 7914 PBKDF2 vectors, and thirteen tamper/truncation/reorder/splice
+attack simulations.
 
 Hand-rolled cryptography is a legitimate risk. Our mitigation is that we hand-rolled only the
 *constructions* — key stretching, counter framing, code truncation — and never the primitives.
