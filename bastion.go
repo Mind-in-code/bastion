@@ -1607,7 +1607,6 @@ func cmdCrypt(args []string, encrypt bool) error {
 	if !encrypt {
 		name = "dec"
 	}
-
 	// Pre-parse and strip auto-wipe flags to support flexible positioning
 	// (e.g. `bastion enc secret.txt -rm` instead of just `bastion enc -rm secret.txt`)
 	var cleanArgs []string
@@ -1635,7 +1634,6 @@ func cmdCrypt(args []string, encrypt bool) error {
 	if err := fl.Parse(args); err != nil {
 		return flagErr(err)
 	}
-
 	// Resolve positional arguments: named flags always take precedence.
 	pos := fl.Args()
 	if *in == "" && len(pos) > 0 {
