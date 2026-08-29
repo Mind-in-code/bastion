@@ -1,0 +1,14 @@
+# Build artefacts — this project ships source, not binaries.
+# A reproducible build is only meaningful if people compile it themselves.
+/bastion
+/bastion.exe
+/dist/
+
+# Test artefacts
+coverage.out
+
+# Local-only notes, never published
+*.local.md
+
+# macOS
+.DS_Store
