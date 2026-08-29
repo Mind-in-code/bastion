@@ -34,6 +34,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"os/signal"
 )
 
 const (
@@ -565,9 +566,64 @@ func totpVerify(secret, code string, unix int64) (bool, error) {
 	return match == 1, nil
 }
 
+func runLiveTOTP(secret string) error {
+	// Pre-check the secret
+	if _, err := totpAt(secret, time.Now().Unix()); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "  "+dim("Live countdown — press [Enter] or Ctrl+C to exit"))
+	fmt.Fprintln(os.Stderr)
+
+	done := make(chan struct{})
+	go func() {
+		stdin.ReadString('\n')
+		close(done)
+	}()
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	defer signal.Stop(sig)
+
+	const barCells = 24
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	// Initial print immediately before ticking
+	for {
+		now := time.Now().Unix()
+		secsLeft := totpStep - now%totpStep
+		code, _ := totpAt(secret, now)
+		
+		formatted := fmt.Sprintf("%s %s", code[:3], code[3:])
+		filled := int(secsLeft * barCells / totpStep)
+		bar := strings.Repeat("█", filled) + strings.Repeat("░", barCells-filled)
+
+		var urgency string
+		if secsLeft <= 5 {
+			urgency = red(fmt.Sprintf("%2ds left", secsLeft))
+		} else {
+			urgency = dim(fmt.Sprintf("%2ds left", secsLeft))
+		}
+		fmt.Fprintf(os.Stderr, "\r  %s  [%s]  %s   ", green(formatted), bar, urgency)
+
+		select {
+		case <-done:
+			fmt.Fprintln(os.Stderr)
+			return nil
+		case <-sig:
+			fmt.Fprintln(os.Stderr)
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
 func cmdTOTPGen(args []string) error {
 	fl := flag.NewFlagSet("totp gen", flag.ContinueOnError)
 	secret := fl.String("secret", "", "base32-encoded shared secret")
+	liveFlag := fl.Bool("live", false, "run interactive live-ticking clock")
 	if err := fl.Parse(args); err != nil {
 		return flagErr(err)
 	}
@@ -579,18 +635,16 @@ func cmdTOTPGen(args []string) error {
 		return usagef("totp gen requires -secret or a positional argument")
 	}
 
+	if *liveFlag || isTTY(os.Stdout) {
+		return runLiveTOTP(*secret)
+	}
+
 	now := time.Now().Unix()
 	code, err := totpAt(*secret, now)
 	if err != nil {
 		return err
 	}
-	left := totpStep - now%totpStep
-
-	fmt.Println(green(code)) // stdout: just the code, so it pipes cleanly
-	notef("valid for %ds", left)
-	if left <= 5 {
-		warnf("this code expires in %ds — wait for the next one if you are cutting it close", left)
-	}
+	fmt.Println(code) // plain code
 	return nil
 }
 
@@ -938,12 +992,25 @@ func cmdHash(args []string) error {
 
 // ---------------------------------------------------------------- interactive TUI menu
 
-// menuHeader is the styled banner shown at the top of every menu screen.
-const menuHeader = "\n" +
-	"╭──────────────────────────────────────────────────────╮\n" +
-	"│   BASTION  —  Zero-Dependency Security Toolbox    │\n" +
-	"│   ┃ AES-256-GCM ┃ PBKDF2-SHA-256 ┃ CSPRNG ┃         │\n" +
-	"╰──────────────────────────────────────────────────────╯"
+func drawDashboard() {
+	clearScreen()
+	fmt.Fprintln(os.Stderr, green("\n╭──────────────────────────────────────────────────────╮"))
+	fmt.Fprintln(os.Stderr, green("│")+"   BASTION  —  Zero-Dependency Security Toolbox       "+green("│"))
+	fmt.Fprintln(os.Stderr, green("│")+"   ┃ AES-256-GCM ┃ PBKDF2-SHA-256 ┃ CSPRNG ┃          "+green("│"))
+	fmt.Fprintln(os.Stderr, green("├──────────────────────────────────────────────────────┤"))
+	fmt.Fprintln(os.Stderr, green("│  ")+"VAULT & FILE OPERATIONS                             "+green("│"))
+	fmt.Fprintln(os.Stderr, green("│    ")+yellow("[1/E]")+" Encrypt File         "+yellow("[2/D]")+" Decrypt File     "+green("│"))
+	fmt.Fprintln(os.Stderr, green("│    ")+yellow("[3/V]")+" View Encrypted       "+yellow("[4/M]")+" In-Place Edit    "+green("│"))
+	fmt.Fprintln(os.Stderr, green("│    ")+yellow("[5/W]")+" Wipe File                                   "+green("│"))
+	fmt.Fprintln(os.Stderr, green("│                                                      │"))
+	fmt.Fprintln(os.Stderr, green("│  ")+"CREDENTIALS & AUDITING                              "+green("│"))
+	fmt.Fprintln(os.Stderr, green("│    ")+yellow("[6/T]")+" 2FA TOTP             "+yellow("[7/S]")+" Secret Scanner   "+green("│"))
+	fmt.Fprintln(os.Stderr, green("│    ")+yellow("[8/G]")+" Password Gen         "+yellow("[9/H]")+" Hash File        "+green("│"))
+	fmt.Fprintln(os.Stderr, green("├──────────────────────────────────────────────────────┤"))
+	fmt.Fprintln(os.Stderr, green("│  ")+yellow("[?]")+" CLI Help                 "+yellow("[0/Q]")+" Quit             "+green("│"))
+	fmt.Fprintln(os.Stderr, green("╰──────────────────────────────────────────────────────╯"))
+	fmt.Fprint(os.Stderr, "  Choice: ")
+}
 
 // clearScreen sends the ANSI "cursor home + erase display" sequence to stderr.
 // Only called inside cmdMenu which already guards on isTTY, so non-interactive
@@ -1013,7 +1080,7 @@ func drawCard(title string, rows [][2]string, ok bool) {
 
 // pauseForEnter waits for the user to press Enter before redrawing the menu.
 func pauseForEnter() {
-	fmt.Fprint(os.Stderr, "\n  "+dim("Press [Enter] to return to menu..."))
+	fmt.Fprint(os.Stderr, "\n  "+dim("Press [Enter] to return to dashboard..."))
 	stdin.ReadString('\n') //nolint:errcheck
 	fmt.Fprintln(os.Stderr)
 }
@@ -1022,9 +1089,9 @@ func pauseForEnter() {
 // and reads one line from stdin, returning the default when the user hits Enter.
 func menuPromptStr(label, def string) (string, error) {
 	if def != "" {
-		fmt.Fprintf(os.Stderr, "  %s [%s]: ", label, def)
+		fmt.Fprintf(os.Stderr, "  %s %s ", label, dim("["+def+"]:"))
 	} else {
-		fmt.Fprintf(os.Stderr, "  %s: ", label)
+		fmt.Fprintf(os.Stderr, "  %s%s ", label, dim(":"))
 	}
 	line, err := stdin.ReadString('\n')
 	if err != nil && line == "" {
@@ -1272,41 +1339,7 @@ func menuTOTP() error {
 	}
 
 	// Generate mode: show a live countdown bar until the window expires.
-	fmt.Fprintln(os.Stderr)
-	fmt.Fprintln(os.Stderr, "  "+dim("Live countdown — auto-exits when the 30s window rolls over"))
-	fmt.Fprintln(os.Stderr)
-
-	const barCells = 24
-	for {
-		now := time.Now().Unix()
-		secsLeft := totpStep - now%totpStep
-		code, err := totpAt(secret, now)
-		if err != nil {
-			fmt.Fprintln(os.Stderr)
-			return err
-		}
-
-		filled := int(secsLeft * barCells / totpStep)
-		bar := strings.Repeat("█", filled) + strings.Repeat("░", barCells-filled)
-
-		var urgency string
-		if secsLeft <= 5 {
-			urgency = red(fmt.Sprintf("%2ds left", secsLeft))
-		} else {
-			urgency = dim(fmt.Sprintf("%2ds left", secsLeft))
-		}
-		fmt.Fprintf(os.Stderr, "\r  %s  [%s]  %s   ",
-			green(code), bar, urgency)
-
-		time.Sleep(time.Second)
-
-		if secsLeft <= 1 {
-			// Window just expired — break out so the card can show the final code.
-			break
-		}
-	}
-	fmt.Fprintln(os.Stderr) // end the \r line
-	return nil
+	return runLiveTOTP(secret)
 }
 
 // menuScan interactively collects a directory path and runs the secret scanner.
@@ -1432,28 +1465,8 @@ func cmdMenu() error {
 		return errQuiet(exitUsage)
 	}
 
-	menuItems := []string{
-		"  " + yellow("[E]") + "ncrypt File          " + dim("AES-256-GCM + PBKDF2"),
-		"  " + yellow("[D]") + "ecrypt File          " + dim("authenticated decryption"),
-		"  " + yellow("[V]") + "iew Encrypted File   " + dim("decrypt to stdout"),
-		"  " + yellow("[I]") + "n-Place Edit         " + dim("secure temporary editor"),
-		"  " + yellow("[W]") + "ipe File             " + dim("cryptographic shredder"),
-		"  " + yellow("[T]") + "OTP Authenticator    " + dim("RFC 6238 · live countdown"),
-		"  " + yellow("[S]") + "can for Secrets      " + dim("entropy + pattern matching"),
-		"  " + yellow("[G]") + "enerate Password     " + dim("CSPRNG · zero bias"),
-		"  " + yellow("[H]") + "ash File             " + dim("SHA-256 / SHA-512"),
-		"  " + yellow("[?]") + " CLI Help Reference",
-		"  " + yellow("[Q]") + "uit",
-	}
-
 	for {
-		clearScreen()
-		fmt.Fprintln(os.Stderr, green(menuHeader))
-		fmt.Fprintln(os.Stderr)
-		for _, item := range menuItems {
-			fmt.Fprintln(os.Stderr, item)
-		}
-		fmt.Fprint(os.Stderr, "\n  Choice: ")
+		drawDashboard()
 
 		line, err := stdin.ReadString('\n')
 		if err != nil {
@@ -1482,7 +1495,7 @@ func cmdMenu() error {
 			runErr = menuDecrypt()
 		case "3", "v":
 			runErr = menuView()
-		case "4", "i":
+		case "4", "m":
 			runErr = menuEdit()
 		case "5", "w":
 			runErr = menuWipe()
@@ -1494,10 +1507,10 @@ func cmdMenu() error {
 			runErr = menuGen()
 		case "9", "h":
 			runErr = menuHash()
-		case "10", "?":
+		case "?", "help":
 			fmt.Fprint(os.Stderr, usageText)
 		default:
-			warnf("Unknown choice %q — use a number 1–10 or a hotkey (E D V I W T S G H Q).", choice)
+			warnf("Unknown choice %q — use a number 1–9 or a hotkey (E D V M W T S G H Q).", choice)
 		}
 
 		if runErr != nil {
@@ -1746,8 +1759,9 @@ func dispatch(args []string) error {
 			return cmdTOTPGen(args[2:])
 		case "verify":
 			return cmdTOTPVerify(args[2:])
+		default:
+			return cmdTOTPGen(args[1:])
 		}
-		return usagef("unknown totp subcommand %q (use gen or verify)", args[1])
 	case "scan":
 		return cmdScan(args[1:])
 	case "gen":
