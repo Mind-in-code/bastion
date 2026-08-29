@@ -1,107 +1,160 @@
 # Bastion
 
-**Bastion** is a high-security, zero-dependency toolbox compiled into a single binary. It provides a suite of cryptographic tools ranging from AES-256-GCM file encryption and cryptographic shredding to live TOTP authentication and secret scanning.
-
-It features a rich Terminal User Interface (TUI) for interactive use, while remaining fully scriptable and pipeable for headless operations.
+**Bastion** is a high-security, zero-dependency security toolbox compiled into a single binary. It provides authenticated file encryption, cryptographic shredding, live TOTP 2FA, secret scanning, password generation, and file hashing — all from one self-contained executable built with Go's standard library only.
 
 ## Features
 
-- **Zero Dependencies**: Built entirely using the Go 1.22+ standard library.
-- **Single File**: All production logic lives in `bastion.go`.
-- **Interactive TUI Dashboard**: Run without arguments to launch a stunning visual menu with clipboard integration, live TOTP clocks, and form-style prompts.
-- **Cross-Platform**: Works seamlessly on Windows, macOS, and Linux.
+- **Zero Dependencies**: Built exclusively on the Go 1.22+ standard library. Empty `require` in `go.mod`.
+- **Single File**: All production logic lives in `bastion.go`. No vendored code.
+- **Interactive TUI Dashboard**: Run without arguments for a rich, visual menu with live TOTP clocks, clipboard integration, and form prompts.
+- **Cross-Platform**: Windows, macOS, and Linux. `CGO_ENABLED=0`.
+- **Reproducible Builds**: Byte-identical binaries across machines (see below).
+- **Cryptographic KAT Suite**: `bastion doctor` runs six Known-Answer Tests to confirm primitives are functioning correctly before any operational use.
 
-## Core Capabilities
-
-### Vault & File Operations
-
-- **Encrypt / Decrypt**: Secure files using AES-256-GCM and PBKDF2-SHA-256. Automatically handles iterations and nonces. Includes `-rm` / `--wipe` flags to securely shred the plaintext after encryption.
-  ```bash
-  bastion enc secret.txt
-  bastion dec secret.txt.enc
-  ```
-- **In-Place Edit**: Securely edit an encrypted file without leaving plaintext traces on disk. Decrypts to a secure temporary file, opens your system `$EDITOR`, re-encrypts, and cryptographically wipes the temp file on exit.
-  ```bash
-  bastion edit secret.txt.enc
-  ```
-- **View**: Decrypt a file directly to `stdout` in-memory.
-  ```bash
-  bastion view secret.txt.enc
-  ```
-- **Wipe**: A cryptographic shredder that overwrites files with random data before unlinking them, ensuring they cannot be recovered.
-  ```bash
-  bastion wipe sensitive.pdf
-  ```
-
-### Credentials & Auditing
-
-- **TOTP Authenticator**: Generate and verify RFC 6238 Time-Based One-Time Passwords. Interactive mode features a live-ticking visual clock.
-  ```bash
-  bastion totp gen <base32-secret>
-  bastion totp verify -secret <base32-secret> -code 123456
-  ```
-- **Password Generator**: Generate highly secure, zero-bias passwords using a CSPRNG. Automatically copies to your clipboard.
-  ```bash
-  bastion gen -len 32 -symbols -copy
-  ```
-- **Secret Scanner**: Recursively scan directories for leaked secrets based on Shannon entropy and known pattern matching.
-  ```bash
-  bastion scan ./project
-  ```
-- **File Hashing**: Stream-hash large files efficiently using SHA-256 or SHA-512.
-  ```bash
-  bastion hash large-archive.zip -algo sha512
-  ```
-
-### Diagnostics
-
-- **Cryptographic Doctor** (`bastion doctor`): Runs a full internal Known-Answer Test (KAT) suite directly inside the binary — no Go toolchain required. Validates PBKDF2 (RFC 2898), AES-256-GCM (NIST SP 800-38D), TOTP (RFC 6238), tamper-resistance (fail-closed AEAD), memory hygiene, and CSPRNG entropy. Renders a boxed ✔/✘ summary card.
-  ```bash
-  bastion doctor
-  ```
-- **Live Hardware Benchmarks** (`bastion bench`): Measures real AES-256-GCM encryption/decryption throughput (MB/s), TOTP and password generation (ops/sec), SHA-256 hashing (MB/s), and Shannon entropy speed (ns/op). Results display in a formatted benchmark card.
-  ```bash
-  bastion bench
-  ```
-
-## Security Guarantees
-
-1. **Authentication First**: Decryption uses authenticated encryption (GCM). Any tampering (bit flips, truncation, chunk swaps) will result in a hard failure without leaking partial plaintext.
-2. **Memory Safety**: Passwords and sensitive memory buffers are explicitly zeroed out (`defer zero(pass)`) when no longer needed.
-3. **No Terminal Echo**: Cross-platform password masking (via `stty` on POSIX and PowerShell on Windows) ensures passwords never leak to the console.
-4. **Secure Defaults**: Generates passwords and nonces using `crypto/rand` (CSPRNG). Evaluates entropy rigorously for secret scanning.
+---
 
 ## Installation
 
-Since Bastion is a single file with zero dependencies, installation is trivial:
-
 ```bash
-go build -trimpath -ldflags="-s -w" -o bastion bastion.go
+CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o bastion bastion.go
 ```
 
-Then move `bastion` (or `bastion.exe`) to your `$PATH`.
+Move `bastion` (or `bastion.exe`) to your `$PATH`.
+
+---
 
 ## Usage
 
-Run `bastion` to launch the interactive TUI Dashboard, or use it via the CLI:
-
-```text
+```
 Usage: bastion <command> [options]
 
-Commands:
-  bastion enc  <file> [-out <path>] [-rm]                    encrypt a file
-  bastion dec  <file> [-out <path>]                          decrypt a file
+  bastion                                                    interactive TUI menu (requires a TTY)
+  bastion enc  [<file>] [-in <f>] [-out <f>] [-pass <p>] [-rounds <n>] [-rm]
+                                                             encrypt (auto-names to <file>.enc)
+  bastion dec  [<file>] [-in <f>] [-out <f>] [-pass <p>]   decrypt (auto-strips .enc suffix)
   bastion view <file.enc>                                    decrypt to stdout
-  bastion edit <file.enc>                                    edit an encrypted file in-place
-  bastion wipe <file>                                        cryptographically shred a file
-  bastion totp gen <secret> [-live]                          generate a 6-digit TOTP code
-  bastion totp verify -secret <secret> -code <digits>        verify a TOTP code
-  bastion scan [<dir>] [-dir <path>] [-entropy <float>]      hunt for leaked secrets (default: .)
-  bastion gen  [-len <int>] [-symbols] [-copy]               generate a strong password
+  bastion edit <file.enc>                                    securely edit in place
+  bastion wipe <file>                                        cryptographic file shredder
+  bastion totp gen    [<secret>] [-secret <b32>]            generate a 6-digit TOTP code
+  bastion totp verify [<secret>] [<code>] [-secret] [-code] verify a code (±1 step drift)
+  bastion scan [<dir>] [-dir <path>] [-entropy <float>]     hunt for leaked secrets (default: .)
+  bastion gen  [-len <int>] [-symbols] [-copy]              generate a strong password
   bastion hash [<file>] [-file <path>] [-algo sha256|sha512] stream-hash a file
   bastion doctor                                             run cryptographic self-diagnostics (KAT)
-  bastion bench                                              run live hardware performance benchmarks
+  bastion bench                                             run live hardware performance benchmarks
 
 EXIT CODES
   0  success        1  bad arguments or I/O error        2  tamper / secret found
-```
+```
+
+> **Tip:** Flags may appear before or after positional arguments, e.g. both `bastion hash file.txt -algo sha512` and `bastion hash -algo sha512 file.txt` work identically.
+
+---
+
+## Commands
+
+### Vault & File Operations
+
+| Command | Description |
+|---|---|
+| `bastion enc secret.txt` | Encrypt to `secret.txt.enc` with PBKDF2 + AES-256-GCM. Prompts for password. |
+| `bastion enc secret.txt -pass pw -rm` | Encrypt and auto-wipe plaintext source. |
+| `bastion dec secret.txt.enc` | Decrypt; auto-strips `.enc` to produce `secret.txt`. |
+| `bastion view secret.txt.enc` | Decrypt in-memory to stdout, no disk writes. |
+| `bastion edit secret.txt.enc` | Decrypt to secure temp file, open `$EDITOR`, re-encrypt, wipe temp. |
+| `bastion wipe oldfile.pdf` | Cryptographic shredder: random bytes + zero overwrite + unlink. |
+
+### Credentials & Auditing
+
+| Command | Description |
+|---|---|
+| `bastion totp gen JBSWY3DPEHPK3PXP` | Live-ticking TOTP clock with progress bar in TTY, raw 6-digit code when piped. |
+| `bastion totp verify -secret JBSWY3DPEHPK3PXP -code 123456` | Validates code with ±1 step drift tolerance. |
+| `bastion scan ./myproject` | Scans for AWS keys, GitHub tokens, PEM blocks, high-entropy strings. Exit 2 if found. |
+| `bastion gen -len 32 -symbols -copy` | CSPRNG password with auto-clipboard copy. |
+| `bastion hash archive.tar.gz -algo sha512` | SHA-512 stream-hash; outputs digest to stdout (pipeable). |
+
+### Diagnostics
+
+| Command | Description |
+|---|---|
+| `bastion doctor` | Runs 6 Known-Answer Tests: PBKDF2 (RFC 7914), AES-256-GCM (NIST SP 800-38D), TOTP (RFC 6238), tamper detection, memory hygiene, CSPRNG liveness. |
+| `bastion bench` | Live hardware benchmark: AES-256-GCM enc/dec throughput, TOTP/password ops/sec, SHA-256 MB/s, Shannon entropy ns/op. |
+
+---
+
+## Security Guarantees
+
+### Threat Model
+
+| Property | Mechanism |
+|---|---|
+| **Confidentiality** | AES-256-GCM — 256-bit key derived via PBKDF2-HMAC-SHA256 (100,000 rounds default). |
+| **Integrity** | Every 64 KiB chunk carries a 16-byte GCM authentication tag. Truncation, reordering, and bit-flipping all cause hard authentication failure. |
+| **Nonce Reuse** | Per-chunk nonce = base XOR (counter[8] \|\| finalFlag[1]). A fresh random base nonce is generated for every encrypt operation via `crypto/rand`. |
+| **Key Derivation** | PBKDF2-HMAC-SHA256 with configurable iteration count (1,000–10,000,000). Count stored in the file header; decryption never needs to be told. |
+| **Side-Channels** | TOTP verification uses `crypto/subtle.ConstantTimeCompare`. Password confirmation is timing-constant. |
+| **Memory Hygiene** | All key material and password buffers are explicitly zeroed (`defer zero(pass)`) immediately after use. |
+
+### Wire Format
+
+```
+┌─────────────┬────────────────┬──────────────┬──────────────────────────────┐
+│  16B Salt   │  4B Rounds     │  12B Nonce   │  64KB chunks + 16B GCM tags  │
+│  (random)   │  (big-endian   │  (random     │  …repeating until EOF…       │
+│             │   uint32)      │   base)      │                              │
+└─────────────┴────────────────┴──────────────┴──────────────────────────────┘
+```
+
+---
+
+## Reproducible Builds
+
+Bastion's build is fully reproducible: two independent builds from the same source produce byte-identical binaries.
+
+**Build command:**
+```bash
+CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" -o bastion bastion.go
+```
+
+**Verification (SHA-256):**
+```
+931d1c77e8fc8cd2f03103773e89d36a9fba89431f7fe62d1c9d12aa4376290c
+```
+
+To verify:
+```bash
+# Linux/macOS
+sha256sum bastion
+# Windows PowerShell
+(Get-FileHash bastion.exe -Algorithm SHA256).Hash.ToLower()
+```
+
+---
+
+## Honest Limitations
+
+- **PBKDF2 vs Argon2id**: Bastion uses PBKDF2-HMAC-SHA256. Argon2id is preferred for new designs because it is memory-hard and resists GPU/ASIC attacks more aggressively. PBKDF2 is used here because it is available in Go's standard library without external dependencies.
+
+- **`-pass` flag visibility**: When `-pass` is supplied on the command line, the passphrase appears in the process table and shell history. For non-interactive automation, prefer piping the password via stdin (echo `pw | bastion enc file`) or injecting it via an environment variable read by the caller.
+
+- **Scanner entropy false positives**: The secret scanner uses Shannon entropy heuristics alongside regex patterns. High-entropy tokens like base64-encoded UUIDs, lorem ipsum encoded strings, or certain identifiers may trigger false positives. Tune the threshold with `-entropy` (default 4.5 bits/char).
+
+- **Filesystem-level attacks**: Bastion encrypts file contents; it does not protect filenames, metadata, directory structure, or file modification times. An adversary with filesystem access can enumerate file names and sizes.
+
+---
+
+## Test Coverage
+
+```bash
+go test -v -cover -short .
+```
+
+- **150 tests** across 12 test groups at ~64.2% statement coverage
+- 100% pass rate
+- Adversarial coverage: 13 tamper/truncation/chunk-swap/splice attack simulations
+- All 6 RFC 6238 TOTP reference vectors
+- NIST SP 800-38D AES-256-GCM vectors
+- RFC 7914 PBKDF2 vectors
+- Native fuzz target: `FuzzDecryptStream` (proves panic-free invariant on arbitrary input)
+- 8 micro-benchmarks including PBKDF2 key derivation throughput

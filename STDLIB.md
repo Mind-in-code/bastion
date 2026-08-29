@@ -28,8 +28,8 @@ the Go Security Policy.
 The cost of this decision is real and worth stating plainly: **we hand-wrote PBKDF2, TOTP, base32
 normalisation, chunked AEAD framing, Shannon entropy, the CLI router, a cryptographic KAT suite,
 and a live hardware benchmark engine.** That is substantially more production code than a dependency
-would otherwise have supplied. We paid for it with a comprehensive test suite — over 100 tests at
-high statement coverage, including six RFC 6238 reference vectors, published SHA digests, NIST
+would otherwise have supplied. We paid for it with a comprehensive test suite — exactly 150 tests at
+~64.2% statement coverage, including six RFC 6238 reference vectors, published SHA digests, NIST
 SP 800-38D AES-GCM vectors, RFC 7914 PBKDF2 vectors, and thirteen tamper/truncation/reorder/splice
 attack simulations.
 
@@ -43,7 +43,7 @@ The three quantified benefits:
 | | |
 |---|---|
 | **Supply chain** | 0 external packages. Nothing to audit, pin, or patch. |
-| **Reproducibility** | Byte-identical builds across directories — SHA-256 `d92be439…f8b964d`. |
+| **Reproducibility** | Byte-identical builds across directories — SHA-256 `931d1c77e8fc8cd2f03103773e89d36a9fba89431f7fe62d1c9d12aa4376290c`. |
 | **Portability** | `CGO_ENABLED=0`, pure Go, cross-compiles anywhere Go runs. |
 
 ---
@@ -60,7 +60,7 @@ The three quantified benefits:
 | 6 | `crypto-compare`, hand-rolled `==` | `crypto/subtle` | `ConstantTimeCompare` for TOTP verification and passphrase confirmation, so comparison time never depends on how many bytes matched. `subtle.XORBytes` also drives the PBKDF2 accumulator. |
 | 7 | `spf13/cobra`, `urfave/cli` | `flag` + `os.Args` dispatch | A hand-written subcommand router (`dispatch`) with per-command `flag.FlagSet`s and nested subcommands (`totp gen` / `totp verify`). Exit codes are 0 = OK, 1 = usage/IO, 2 = security. Uses `ContinueOnError`, because `ExitOnError` exits with status 2 and would make a flag typo indistinguishable from a tamper alert. |
 | 8 | `fatih/color`, `chalk` | Raw ANSI escape sequences | Green / red / yellow / dim via `\x1b[…m`, auto-disabled when stdout is not a terminal or `NO_COLOR` is set. Results go to stdout, commentary to stderr, so `bastion gen \| pbcopy` pipes a clean password. |
-| 9 | `stretchr/testify`, `jest` | `testing` | 96 tests, 90.9% coverage, table-driven with plain `if`/`t.Errorf`. Includes 13 adversarial attack simulations, 25 subprocess cases that assert real process exit codes, and 8 benchmarks with `-benchmem`. No assertion library. |
+| 9 | `stretchr/testify`, `jest` | `testing` | 150 tests, ~64.2% statement coverage on standard test run (TUI and interactive paths excluded by design), table-driven with plain `if`/`t.Errorf`. Includes 13 adversarial attack simulations, 29 subprocess cases asserting real process exit codes, a native fuzz target, 8 benchmarks with `-benchmem`, and a full cryptographic KAT suite (6 Known-Answer Tests, NIST SP 800-38D, RFC 7914, RFC 6238). No assertion library. |
 | 10 | `joho/godotenv`, `dotenv` | `bufio.Scanner` + `strings` | Line-oriented input handling: `bufio.Scanner` walks scanned files a line at a time with a 1 MB cap, and reads the passphrase from stdin; `strings` normalises base32 secrets (case, spaces, hyphens, padding) before decoding. |
 | 11 | `atotto/clipboard` | `os/exec` + explicit zeroing | Secret handling without a clipboard package. `os/exec` toggles terminal echo via `stty` so a typed passphrase never appears on screen; `zero()` overwrites key and passphrase buffers immediately after use; and because stdout stays pipeable, the user's own `pbcopy`/`xclip` does the clipboard job. |
 

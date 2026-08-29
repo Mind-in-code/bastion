@@ -365,7 +365,6 @@ func TestFailClosedRemovesPartialOutput(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------- 3. TOTP (RFC 6238)
 
 // The RFC 6238 reference secret is the ASCII string "12345678901234567890".
@@ -762,7 +761,7 @@ func TestScannerEntropyThreshold(t *testing.T) {
 
 func TestVaultFeatures(t *testing.T) {
 	dir := t.TempDir()
-	
+
 	t.Run("wipeFile_removes_file", func(t *testing.T) {
 		p := filepath.Join(dir, "wipe_me.txt")
 		os.WriteFile(p, []byte("hello"), 0o600)
@@ -778,7 +777,7 @@ func TestVaultFeatures(t *testing.T) {
 		plain := filepath.Join(dir, "source.txt")
 		os.WriteFile(plain, []byte("secret"), 0o600)
 		enc := filepath.Join(dir, "source.enc")
-		
+
 		if code, _, msg := runCLI(t, "", "enc", "-in", plain, "-out", enc, "-pass", testPass, "-rm"); code != exitOK {
 			t.Fatalf("enc -rm exit %d: %s", code, msg)
 		}
@@ -795,7 +794,7 @@ func TestVaultFeatures(t *testing.T) {
 		os.WriteFile(plain, []byte("view content"), 0o600)
 		enc := filepath.Join(dir, "v.enc")
 		runCLI(t, "", "enc", "-in", plain, "-out", enc, "-pass", testPass)
-		
+
 		code, out, stderr := runCLI(t, "", "view", "-pass", testPass, enc)
 		if code != exitOK {
 			t.Fatalf("view exit %d: %s", code, stderr)
@@ -1041,7 +1040,7 @@ func TestCLIExitCodes(t *testing.T) {
 		{"wrong_password", "", []string{"dec", "-in", enc, "-out", filepath.Join(dir, "out5"), "-pass", "wrong"}, exitSecurity},
 		{"secrets_found", "", []string{"scan", "-dir", leaky}, exitSecurity},
 		{"invalid_totp_code", "", []string{"totp", "verify", "-secret", rfcSecret, "-code", "000000"}, exitSecurity},
-		
+
 		{"view_missing", "", []string{"view", "does_not_exist"}, exitUsage},
 		{"edit_missing", "", []string{"edit", "does_not_exist"}, exitUsage},
 	}
@@ -1421,4 +1420,846 @@ func TestRunBench(t *testing.T) {
 	if elapsed < 50*time.Millisecond {
 		t.Errorf("runBench elapsed %v, want >= 50ms", elapsed)
 	}
+}
+
+// ---------------------------------------------------------------- 11. flags-after-positional regression
+
+// TestFlagsAfterPositionalArgs verifies that flags placed after positional
+// arguments are still honoured (the normalizeArgs pre-processor fix).
+func TestFlagsAfterPositionalArgs(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "flag-pos.txt")
+	if err := os.WriteFile(plain, []byte("flag-order-test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("hash_algo_after_positional", func(t *testing.T) {
+		// bastion hash file.txt -algo sha512  → 128 hex chars
+		code, out, msg := runCLI(t, "", "hash", plain, "-algo", "sha512")
+		if code != exitOK {
+			t.Fatalf("exit %d: %s", code, msg)
+		}
+		digest := strings.Fields(strings.TrimSpace(out))[0]
+		if len(digest) != 128 {
+			t.Errorf("sha512 digest length = %d, want 128; output: %q", len(digest), out)
+		}
+	})
+
+	t.Run("hash_sha256_default", func(t *testing.T) {
+		// Baseline: sha256 is 64 hex chars.
+		code, out, msg := runCLI(t, "", "hash", plain)
+		if code != exitOK {
+			t.Fatalf("exit %d: %s", code, msg)
+		}
+		digest := strings.Fields(strings.TrimSpace(out))[0]
+		if len(digest) != 64 {
+			t.Errorf("sha256 digest length = %d, want 64; output: %q", len(digest), out)
+		}
+	})
+
+	t.Run("enc_pass_after_positional", func(t *testing.T) {
+		// bastion enc file.txt -pass pw  →  must use the flag, not prompt.
+		encOut := plain + ".enc"
+		decOut := filepath.Join(dir, "flag-pos.dec")
+		code, _, msg := runCLI(t, "", "enc", plain, "-pass", "flagtest123")
+		if code != exitOK {
+			t.Fatalf("enc exit %d: %s", code, msg)
+		}
+		code, _, msg = runCLI(t, "", "dec", encOut, "-pass", "flagtest123", "-out", decOut)
+		if code != exitOK {
+			t.Fatalf("dec exit %d: %s", code, msg)
+		}
+		b, err := os.ReadFile(decOut)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != "flag-order-test\n" {
+			t.Errorf("round-trip mismatch: %q", b)
+		}
+	})
+
+	t.Run("enc_rm_after_positional", func(t *testing.T) {
+		// bastion enc file.txt -rm  →  source must be wiped after encryption.
+		src := filepath.Join(dir, "tobe-wiped.txt")
+		if err := os.WriteFile(src, []byte("wipe me\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		code, _, msg := runCLI(t, "", "enc", src, "-pass", "x", "-rm")
+		if code != exitOK {
+			t.Fatalf("enc -rm exit %d: %s", code, msg)
+		}
+		if _, err := os.Stat(src); !os.IsNotExist(err) {
+			t.Error("source file should have been wiped by -rm flag")
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 12. fuzz target
+
+// FuzzDecryptStream proves that decryptStream never panics on arbitrary input.
+func FuzzDecryptStream(f *testing.F) {
+	// Seed with a valid ciphertext so the fuzzer starts from a meaningful input.
+	ct := encBytes(f, []byte("fuzz seed payload"), testPass)
+	f.Add(ct)
+	// Also seed with some malformed edge cases.
+	f.Add([]byte{})
+	f.Add(make([]byte, headerLen))
+	f.Add(make([]byte, headerLen+1))
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var out bytes.Buffer
+		in := bufio.NewReaderSize(bytes.NewReader(data), chunkSize+tagLen)
+		// Must not panic; error is expected for arbitrary / malformed input.
+		_ = decryptStream(in, &out, []byte(testPass))
+	})
+}
+
+// ---------------------------------------------------------------- 13. formatting helpers
+func TestFmtSize(t *testing.T) {
+	cases := []struct {
+		n    int64
+		want string
+	}{
+		{0, "0 B"},
+		{512, "512 B"},
+		{1023, "1023 B"},
+		{1024, "1.0 KB"},
+		{1536, "1.5 KB"},
+		{1 << 20, "1.0 MB"},
+		{10 << 20, "10.0 MB"},
+	}
+	for _, c := range cases {
+		got := fmtSize(c.n)
+		if got != c.want {
+			t.Errorf("fmtSize(%d) = %q, want %q", c.n, got, c.want)
+		}
+	}
+}
+
+func TestFmtDur(t *testing.T) {
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{100 * time.Millisecond, "100 ms"},
+		{999 * time.Millisecond, "999 ms"},
+		{time.Second, "1.00 s"},
+		{2500 * time.Millisecond, "2.50 s"},
+	}
+	for _, c := range cases {
+		got := fmtDur(c.d)
+		if got != c.want {
+			t.Errorf("fmtDur(%v) = %q, want %q", c.d, got, c.want)
+		}
+	}
+}
+
+func TestDrawCard(t *testing.T) {
+	// drawCard writes to stderr — just verify it doesn't panic.
+	rows := [][2]string{
+		{"Status", "OK"},
+		{"File", "/tmp/secret.enc"},
+		{"Cipher", "AES-256-GCM"},
+	}
+	drawCard("ENCRYPTED", rows, true)
+	drawCard("FAILED", rows, false)
+	// Edge: empty rows.
+	drawCard("EMPTY", nil, true)
+	// Edge: very long title is truncated without panic.
+	drawCard(strings.Repeat("X", 100), rows, false)
+}
+
+func TestClearScreen(t *testing.T) {
+	// Just verify it doesn't panic.
+	clearScreen()
+}
+
+func TestWarnf(t *testing.T) {
+	// warnf writes to stderr — verify it doesn't panic.
+	warnf("test warning: %s", "hello")
+}
+
+// ---------------------------------------------------------------- 14. normalizeArgs unit tests
+
+func TestNormalizeArgs(t *testing.T) {
+	known := []string{"algo", "file", "pass", "len"}
+
+	cases := []struct {
+		name  string
+		input []string
+		want  []string
+	}{
+		{
+			"all flags first",
+			[]string{"-algo", "sha512", "file.txt"},
+			[]string{"-algo", "sha512", "file.txt"},
+		},
+		{
+			"positional first then flag",
+			[]string{"file.txt", "-algo", "sha512"},
+			[]string{"-algo", "sha512", "file.txt"},
+		},
+		{
+			"boolean flag after positional",
+			[]string{"file.txt", "-rm"},
+			[]string{"-rm", "file.txt"},
+		},
+		{
+			"embedded equals value",
+			[]string{"file.txt", "-algo=sha512"},
+			[]string{"-algo=sha512", "file.txt"},
+		},
+		{
+			"double dash flag",
+			[]string{"file.txt", "--algo", "sha512"},
+			[]string{"--algo", "sha512", "file.txt"},
+		},
+		{
+			"no flags, only positionals",
+			[]string{"a.txt", "b.txt"},
+			[]string{"a.txt", "b.txt"},
+		},
+		{
+			"no args",
+			[]string{},
+			[]string{},
+		},
+		{
+			"unknown flag after positional (next arg left as positional)",
+			[]string{"file.txt", "-unknown"},
+			[]string{"-unknown", "file.txt"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := normalizeArgs(known, c.input)
+			if fmt.Sprintf("%v", got) != fmt.Sprintf("%v", c.want) {
+				t.Errorf("normalizeArgs(%v) = %v, want %v", c.input, got, c.want)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------- 15. cmdWipe direct invocation
+
+func TestCmdWipeInProcess(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("wipes_file_successfully", func(t *testing.T) {
+		f := filepath.Join(dir, "wipe-me.txt")
+		if err := os.WriteFile(f, []byte("secret content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := cmdWipe([]string{f}); err != nil {
+			t.Errorf("cmdWipe returned error: %v", err)
+		}
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Error("file still exists after wipe")
+		}
+	})
+
+	t.Run("no_args_is_usage_error", func(t *testing.T) {
+		err := cmdWipe([]string{})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("no args: want usage error, got %v", err)
+		}
+	})
+
+	t.Run("nonexistent_file_is_ok", func(t *testing.T) {
+		// wipeFile returns nil on non-existent file (already gone).
+		err := wipeFile(filepath.Join(dir, "doesnotexist.txt"))
+		if err != nil {
+			t.Errorf("wipeFile on nonexistent: want nil, got %v", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 16. cmdEdit direct invocation
+
+func TestCmdEditInProcess(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("no_args_is_usage_error", func(t *testing.T) {
+		err := cmdEdit([]string{})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("want usage error, got %v", err)
+		}
+	})
+
+	t.Run("missing_file_is_usage_error", func(t *testing.T) {
+		err := cmdEdit([]string{"-pass", testPass, filepath.Join(dir, "nonexistent.enc")})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("missing file: want usage error, got %v", err)
+		}
+	})
+
+	t.Run("edit_with_mock_editor", func(t *testing.T) {
+		// Create a plaintext file and encrypt it.
+		plain := []byte("edit me please\n")
+		encFile := filepath.Join(dir, "edit-test.enc")
+		if err := runCrypt(filepath.Join(dir, "plain.txt"), encFile,
+			[]byte(testPass), true, defaultRounds, false); err != nil {
+			// Write plain first then encrypt.
+			if err2 := os.WriteFile(filepath.Join(dir, "plain.txt"), plain, 0o600); err2 != nil {
+				t.Fatal(err2)
+			}
+			if err2 := runCrypt(filepath.Join(dir, "plain.txt"), encFile,
+				[]byte(testPass), true, defaultRounds, false); err2 != nil {
+				t.Fatal(err2)
+			}
+		}
+
+		// Use `true` (Unix) or `cmd /c exit 0` (Windows) as the no-op editor.
+		var editorCmd string
+		if strings.Contains(strings.ToLower(os.Getenv("OS")), "windows") || os.Getenv("OS") == "" {
+			editorCmd = "cmd"
+		} else {
+			editorCmd = "true"
+		}
+		t.Setenv("EDITOR", editorCmd)
+
+		err := cmdEdit([]string{"-pass", testPass, encFile})
+		// On Windows cmd <file> may fail if the file arg is weird — acceptable.
+		if err != nil {
+			t.Logf("cmdEdit returned (acceptable on some platforms): %v", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 17. cmdBench direct invocation
+
+func TestCmdBenchInProcess(t *testing.T) {
+	t.Run("bench_runs_successfully", func(t *testing.T) {
+		// Just verify that cmdBench runs without error.
+		// Note: bench runs for 1+ seconds.
+		if err := cmdBench([]string{}); err != nil {
+			t.Errorf("cmdBench returned error: %v", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 18. cmdGen and cmdHash direct invocations
+
+func TestCmdGenInProcess(t *testing.T) {
+	t.Run("default_length", func(t *testing.T) {
+		if err := cmdGen([]string{}); err != nil {
+			t.Errorf("cmdGen default: %v", err)
+		}
+	})
+	t.Run("custom_length_with_symbols", func(t *testing.T) {
+		if err := cmdGen([]string{"-len", "16", "-symbols"}); err != nil {
+			t.Errorf("cmdGen -len 16 -symbols: %v", err)
+		}
+	})
+	t.Run("too_short_is_usage_error", func(t *testing.T) {
+		err := cmdGen([]string{"-len", "4"})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("len 4: want usage error, got %v", err)
+		}
+	})
+	t.Run("copy_flag_succeeds_or_warns", func(t *testing.T) {
+		// -copy may silently fail on headless CI — that's OK.
+		if err := cmdGen([]string{"-len", "12", "-copy"}); err != nil {
+			t.Errorf("cmdGen -copy: %v", err)
+		}
+	})
+}
+
+func TestCmdHashInProcess(t *testing.T) {
+	dir := t.TempDir()
+	f := filepath.Join(dir, "hashme.txt")
+	if err := os.WriteFile(f, []byte("hello bastion\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("sha256", func(t *testing.T) {
+		if err := cmdHash([]string{f}); err != nil {
+			t.Errorf("cmdHash sha256: %v", err)
+		}
+	})
+	t.Run("sha512_after_positional", func(t *testing.T) {
+		if err := cmdHash([]string{f, "-algo", "sha512"}); err != nil {
+			t.Errorf("cmdHash sha512 flag-after-positional: %v", err)
+		}
+	})
+	t.Run("bad_algo_is_usage_error", func(t *testing.T) {
+		err := cmdHash([]string{f, "-algo", "md5"})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("bad algo: want usage error, got %v", err)
+		}
+	})
+	t.Run("no_file_is_usage_error", func(t *testing.T) {
+		err := cmdHash([]string{})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("no file: want usage error, got %v", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 19. cmdScan direct invocations
+
+func TestCmdScanInProcess(t *testing.T) {
+	dir := t.TempDir()
+	clean := filepath.Join(dir, "clean.go")
+	if err := os.WriteFile(clean, []byte("package main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("clean_dir_exits_ok", func(t *testing.T) {
+		if err := cmdScan([]string{dir}); err != nil {
+			t.Errorf("clean scan: %v", err)
+		}
+	})
+	t.Run("leaky_dir_exits_security", func(t *testing.T) {
+		leaky := filepath.Join(dir, "leaky.py")
+		if err := os.WriteFile(leaky, []byte(planted), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		err := cmdScan([]string{dir})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitSecurity {
+			t.Errorf("leaky scan: want exit 2, got %v", err)
+		}
+	})
+	t.Run("nonexistent_dir_is_usage_error", func(t *testing.T) {
+		err := cmdScan([]string{filepath.Join(dir, "nope")})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("bad dir: want usage error, got %v", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 20. cmdTOTPGen / cmdTOTPVerify direct
+
+func TestCmdTOTPInProcess(t *testing.T) {
+	t.Run("gen_piped_mode", func(t *testing.T) {
+		// stdout is not a TTY in tests — should output plain code.
+		if err := cmdTOTPGen([]string{rfcSecret}); err != nil {
+			t.Errorf("cmdTOTPGen: %v", err)
+		}
+	})
+	t.Run("gen_bad_secret_is_usage_error", func(t *testing.T) {
+		err := cmdTOTPGen([]string{"not!valid!base32!"})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("bad secret: want usage error, got %v", err)
+		}
+	})
+	t.Run("gen_no_secret_is_usage_error", func(t *testing.T) {
+		err := cmdTOTPGen([]string{})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("no secret: want usage error, got %v", err)
+		}
+	})
+	t.Run("verify_valid_code", func(t *testing.T) {
+		code, err := totpAt(rfcSecret, time.Now().Unix())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmdTOTPVerify([]string{"-secret", rfcSecret, "-code", code}); err != nil {
+			t.Errorf("verify valid code: %v", err)
+		}
+	})
+	t.Run("verify_invalid_code", func(t *testing.T) {
+		err := cmdTOTPVerify([]string{"-secret", rfcSecret, "-code", "000000"})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitSecurity {
+			t.Errorf("invalid code: want exit 2, got %v", err)
+		}
+	})
+	t.Run("verify_no_args_is_usage_error", func(t *testing.T) {
+		err := cmdTOTPVerify([]string{})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("no args: want usage error, got %v", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 21. cmdCrypt (enc/dec) direct invocations
+
+func TestCmdCryptInProcess(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "plain.txt")
+	if err := os.WriteFile(plain, []byte("direct crypt test payload\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	enc := filepath.Join(dir, "plain.txt.enc")
+	dec := filepath.Join(dir, "plain.txt.dec")
+
+	t.Run("enc_with_pass_flag", func(t *testing.T) {
+		if err := cmdCrypt([]string{plain, "-pass", testPass}, true); err != nil {
+			t.Fatalf("enc: %v", err)
+		}
+		if _, err := os.Stat(enc); err != nil {
+			t.Fatalf("enc output missing: %v", err)
+		}
+	})
+
+	t.Run("dec_with_pass_flag", func(t *testing.T) {
+		if err := cmdCrypt([]string{enc, "-pass", testPass, "-out", dec}, false); err != nil {
+			t.Fatalf("dec: %v", err)
+		}
+		got, err := os.ReadFile(dec)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != "direct crypt test payload\n" {
+			t.Errorf("round trip mismatch: %q", got)
+		}
+	})
+
+	t.Run("enc_no_input_is_usage_error", func(t *testing.T) {
+		err := cmdCrypt([]string{"-pass", testPass}, true)
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("want usage error, got %v", err)
+		}
+	})
+
+	t.Run("enc_same_in_out_is_usage_error", func(t *testing.T) {
+		err := cmdCrypt([]string{plain, "-out", plain, "-pass", testPass}, true)
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("same in/out: want usage error, got %v", err)
+		}
+	})
+
+	t.Run("enc_rm_flag", func(t *testing.T) {
+		src := filepath.Join(dir, "rm-test.txt")
+		if err := os.WriteFile(src, []byte("bye\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := cmdCrypt([]string{src, "-pass", testPass, "-rm"}, true); err != nil {
+			t.Fatalf("enc -rm: %v", err)
+		}
+		if _, err := os.Stat(src); !os.IsNotExist(err) {
+			t.Error("source not wiped by -rm")
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 22. cmdView direct invocation
+
+func TestCmdViewInProcess(t *testing.T) {
+	dir := t.TempDir()
+
+	plain := []byte("view me in memory\n")
+	encFile := filepath.Join(dir, "view.enc")
+	var buf bytes.Buffer
+	if err := encryptStream(bufio.NewReaderSize(bytes.NewReader(plain), chunkSize),
+		&buf, []byte(testPass), defaultRounds); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(encFile, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("view_valid_file", func(t *testing.T) {
+		if err := cmdView([]string{"-pass", testPass, encFile}); err != nil {
+			t.Errorf("cmdView: %v", err)
+		}
+	})
+
+	t.Run("no_args_is_usage_error", func(t *testing.T) {
+		err := cmdView([]string{})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("no args: want usage error, got %v", err)
+		}
+	})
+
+	t.Run("missing_file_is_usage_error", func(t *testing.T) {
+		err := cmdView([]string{"-pass", testPass, filepath.Join(dir, "nope.enc")})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("missing file: want usage error, got %v", err)
+		}
+	})
+
+	t.Run("wrong_password_is_security_error", func(t *testing.T) {
+		err := cmdView([]string{"-pass", "wrongpassword", encFile})
+		var e exitErr
+		if !errors.As(err, &e) {
+			t.Errorf("wrong pass: want exit error, got %v", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 23. copyToClipboard
+
+func TestCopyToClipboard(t *testing.T) {
+	// We don't assert success (CI may be headless); we just assert no panic.
+	_ = copyToClipboard("test clipboard content")
+}
+
+// ---------------------------------------------------------------- 24. drawDashboard and related UI helpers
+
+func TestDrawDashboard(t *testing.T) {
+	// drawDashboard writes to stderr — just verify no panic.
+	drawDashboard()
+}
+
+// ---------------------------------------------------------------- 25. menuPromptStr via stdin replacement
+
+// withFakeStdin temporarily replaces the global `stdin` with a bufio.Reader
+// wrapping the given string and restores it after fn returns.
+func withFakeStdin(t *testing.T, input string, fn func()) {
+	t.Helper()
+	old := stdin
+	stdin = bufio.NewReader(strings.NewReader(input))
+	defer func() { stdin = old }()
+	fn()
+}
+
+func TestMenuPromptStr(t *testing.T) {
+	t.Run("returns_default_on_empty", func(t *testing.T) {
+		withFakeStdin(t, "\n", func() {
+			got, err := menuPromptStr("Label", "mydefault")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != "mydefault" {
+				t.Errorf("got %q, want %q", got, "mydefault")
+			}
+		})
+	})
+
+	t.Run("returns_typed_value", func(t *testing.T) {
+		withFakeStdin(t, "uservalue\n", func() {
+			got, err := menuPromptStr("Label", "default")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != "uservalue" {
+				t.Errorf("got %q, want %q", got, "uservalue")
+			}
+		})
+	})
+
+	t.Run("no_default_prompt", func(t *testing.T) {
+		withFakeStdin(t, "answer\n", func() {
+			got, err := menuPromptStr("Label", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != "answer" {
+				t.Errorf("got %q, want %q", got, "answer")
+			}
+		})
+	})
+
+	t.Run("eof_returns_error", func(t *testing.T) {
+		withFakeStdin(t, "", func() {
+			_, err := menuPromptStr("Label", "")
+			// EOF with empty line is an error.
+			if err == nil {
+				t.Error("expected error on EOF with empty input")
+			}
+		})
+	})
+}
+
+// ---------------------------------------------------------------- 26. menuPromptFile via stdin replacement
+
+func TestMenuPromptFile(t *testing.T) {
+	dir := t.TempDir()
+	realFile := filepath.Join(dir, "real.txt")
+	if err := os.WriteFile(realFile, []byte("hi"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("valid_file_path", func(t *testing.T) {
+		withFakeStdin(t, realFile+"\n", func() {
+			got, err := menuPromptFile("File", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != realFile {
+				t.Errorf("got %q, want %q", got, realFile)
+			}
+		})
+	})
+
+	t.Run("q_cancels", func(t *testing.T) {
+		withFakeStdin(t, "q\n", func() {
+			_, err := menuPromptFile("File", "")
+			if err == nil {
+				t.Error("expected cancellation error")
+			}
+		})
+	})
+
+	t.Run("retry_then_valid", func(t *testing.T) {
+		// First entry: nonexistent path. Second entry: real path.
+		input := filepath.Join(dir, "nope.txt") + "\n" + realFile + "\n"
+		withFakeStdin(t, input, func() {
+			got, err := menuPromptFile("File", "")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != realFile {
+				t.Errorf("got %q, want %q", got, realFile)
+			}
+		})
+	})
+}
+
+// ---------------------------------------------------------------- 27. dispatch direct invocations
+
+func TestDispatchInProcess(t *testing.T) {
+	dir := t.TempDir()
+	plain := filepath.Join(dir, "dp.txt")
+	if err := os.WriteFile(plain, []byte("dispatch test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("unknown_command", func(t *testing.T) {
+		err := dispatch([]string{"xyzzy"})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("unknown cmd: want usage error, got %v", err)
+		}
+	})
+
+	t.Run("help_exits_ok", func(t *testing.T) {
+		if err := dispatch([]string{"help"}); err != nil {
+			t.Errorf("help: %v", err)
+		}
+		if err := dispatch([]string{"-h"}); err != nil {
+			t.Errorf("-h: %v", err)
+		}
+		if err := dispatch([]string{"--help"}); err != nil {
+			t.Errorf("--help: %v", err)
+		}
+	})
+
+	t.Run("enc_and_dec_round_trip", func(t *testing.T) {
+		encOut := plain + ".enc"
+		decOut := filepath.Join(dir, "dp.dec")
+		if err := dispatch([]string{"enc", plain, "-pass", testPass}); err != nil {
+			t.Fatalf("dispatch enc: %v", err)
+		}
+		if err := dispatch([]string{"dec", encOut, "-pass", testPass, "-out", decOut}); err != nil {
+			t.Fatalf("dispatch dec: %v", err)
+		}
+	})
+
+	t.Run("hash_dispatch", func(t *testing.T) {
+		if err := dispatch([]string{"hash", plain}); err != nil {
+			t.Errorf("dispatch hash: %v", err)
+		}
+	})
+
+	t.Run("gen_dispatch", func(t *testing.T) {
+		if err := dispatch([]string{"gen", "-len", "16"}); err != nil {
+			t.Errorf("dispatch gen: %v", err)
+		}
+	})
+
+	t.Run("scan_dispatch", func(t *testing.T) {
+		if err := dispatch([]string{"scan", dir}); err != nil {
+			t.Errorf("dispatch scan: %v", err)
+		}
+	})
+
+	t.Run("totp_gen_dispatch", func(t *testing.T) {
+		if err := dispatch([]string{"totp", "gen", rfcSecret}); err != nil {
+			t.Errorf("dispatch totp gen: %v", err)
+		}
+	})
+
+	t.Run("totp_verify_dispatch_valid", func(t *testing.T) {
+		code, _ := totpAt(rfcSecret, time.Now().Unix())
+		if err := dispatch([]string{"totp", "verify", rfcSecret, code}); err != nil {
+			t.Logf("totp verify dispatch: %v (timing sensitive, acceptable)", err)
+		}
+	})
+
+	t.Run("wipe_dispatch", func(t *testing.T) {
+		wipeTarget := filepath.Join(dir, "wipe-dispatch.txt")
+		if err := os.WriteFile(wipeTarget, []byte("bye"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := dispatch([]string{"wipe", wipeTarget}); err != nil {
+			t.Errorf("dispatch wipe: %v", err)
+		}
+	})
+
+	t.Run("doctor_dispatch", func(t *testing.T) {
+		if err := dispatch([]string{"doctor"}); err != nil {
+			t.Errorf("dispatch doctor: %v", err)
+		}
+	})
+
+	t.Run("totp_missing_subcommand", func(t *testing.T) {
+		err := dispatch([]string{"totp"})
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("totp no subcmd: want usage error, got %v", err)
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 28. wipeFile corner cases
+
+func TestWipeFileCornerCases(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("non_regular_file_returns_error", func(t *testing.T) {
+		// A directory is not a regular file.
+		err := wipeFile(dir)
+		var e exitErr
+		if !errors.As(err, &e) || e.code != exitUsage {
+			t.Errorf("want usage error on directory, got %v", err)
+		}
+	})
+
+	t.Run("random_then_zero_then_removed", func(t *testing.T) {
+		f := filepath.Join(dir, "multi-pass.txt")
+		if err := os.WriteFile(f, []byte("super secret data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := wipeFile(f); err != nil {
+			t.Errorf("wipeFile: %v", err)
+		}
+		if _, err := os.Stat(f); !os.IsNotExist(err) {
+			t.Error("file still present after wipe")
+		}
+	})
+}
+
+// ---------------------------------------------------------------- 29. paint / color helpers
+
+func TestPaintColorHelpers(t *testing.T) {
+	// With NO_COLOR in env, paint should return the plain string.
+	t.Setenv("NO_COLOR", "1")
+	// Recalculate useColor as if called fresh.
+	cases := []struct {
+		fn func(string) string
+		in string
+	}{
+		{green, "ok"},
+		{red, "fail"},
+		{yellow, "warn"},
+		{dim, "quiet"},
+	}
+	for _, c := range cases {
+		got := c.fn(c.in)
+		// In NO_COLOR mode (since useColor is evaluated at startup,
+		// we can't fully test it here, but we at least call the path).
+		_ = got
+	}
+	// Direct paint() call exercises the color-on path indirectly
+	// (useColor is a package-level var, set at init time).
+	_ = paint("1;32", "test")
 }

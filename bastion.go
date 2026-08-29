@@ -29,12 +29,12 @@ import (
 	"math/big"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"time"
-	"os/signal"
 )
 
 const (
@@ -80,6 +80,50 @@ var errTamper = exitErr{exitSecurity, "authentication failed: wrong password or 
 // errQuiet exits with a code but prints nothing (the flag package already reported).
 func errQuiet(code int) error { return exitErr{code, ""} }
 
+// normalizeArgs reorders args so all flag arguments (-flag, --flag, -flag val)
+// appear before positional arguments. This lets flag.FlagSet parse flags that
+// come after positional args (e.g. `bastion hash file.txt -algo sha512`).
+func normalizeArgs(knownFlags []string, args []string) []string {
+	// Build a set for O(1) lookups.
+	flagSet := make(map[string]bool, len(knownFlags))
+	for _, f := range knownFlags {
+		flagSet[f] = true
+	}
+
+	// booleans that take no value vs flags that consume the next token.
+	// We don't know which flags are bool, so we treat any arg immediately
+	// following a recognised -flag that itself does NOT start with '-' as its value.
+	var flags, positional []string
+	for i := 0; i < len(args); {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") {
+			positional = append(positional, a)
+			i++
+			continue
+		}
+		// It's a flag token. Keep it.
+		flags = append(flags, a)
+		i++
+		// If the flag doesn't contain '=' and the next token doesn't start
+		// with '-', it is likely the flag's value — keep it with the flag.
+		name := strings.TrimLeft(a, "-")
+		if idx := strings.IndexByte(name, '='); idx >= 0 {
+			// value already embedded (e.g. -algo=sha512)
+			continue
+		}
+		if i < len(args) && !strings.HasPrefix(args[i], "-") {
+			// Peek: if the flag name is in the known set, treat next arg as value.
+			// Unknown flags: we can't tell if they're bool, so we leave the next
+			// arg as-is (positional) to avoid eating a positional by mistake.
+			if flagSet[name] {
+				flags = append(flags, args[i])
+				i++
+			}
+		}
+	}
+	return append(flags, positional...)
+}
+
 // ---------------------------------------------------------------- output
 
 var useColor = os.Getenv("NO_COLOR") == "" && isTTY(os.Stdout)
@@ -110,6 +154,9 @@ func fatal(format string, a ...any) {
 }
 
 func isTTY(f *os.File) bool {
+	if os.Getenv("BASTION_TEST_NOTTY") == "1" {
+		return false
+	}
 	fi, err := f.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
@@ -451,7 +498,7 @@ func runCrypt(inPath, outPath string, pass []byte, encrypt bool, rounds int, wip
 	} else {
 		okf("Decrypted %s → %s (%d bytes)", inPath, outPath, fi.Size())
 	}
-	
+
 	src.Close() // Explicit close so Windows lets us wipe it
 	if wipeSource && encrypt {
 		if err := wipeFile(inPath); err != nil {
@@ -478,7 +525,7 @@ func wipeFile(path string) error {
 		return err
 	}
 	size := fi.Size()
-	
+
 	// Pass 1: Random bytes
 	buf := make([]byte, 32*1024)
 	for written := int64(0); written < size; {
@@ -494,7 +541,7 @@ func wipeFile(path string) error {
 		written += chunk
 	}
 	f.Sync()
-	
+
 	// Pass 2: Zeroes
 	if _, err := f.Seek(0, 0); err != nil {
 		f.Close()
@@ -595,7 +642,7 @@ func runLiveTOTP(secret string) error {
 		now := time.Now().Unix()
 		secsLeft := totpStep - now%totpStep
 		code, _ := totpAt(secret, now)
-		
+
 		formatted := fmt.Sprintf("%s %s", code[:3], code[3:])
 		filled := int(secsLeft * barCells / totpStep)
 		bar := strings.Repeat("█", filled) + strings.Repeat("░", barCells-filled)
@@ -621,6 +668,7 @@ func runLiveTOTP(secret string) error {
 }
 
 func cmdTOTPGen(args []string) error {
+	args = normalizeArgs([]string{"secret", "live"}, args)
 	fl := flag.NewFlagSet("totp gen", flag.ContinueOnError)
 	secret := fl.String("secret", "", "base32-encoded shared secret")
 	liveFlag := fl.Bool("live", false, "run interactive live-ticking clock")
@@ -649,6 +697,7 @@ func cmdTOTPGen(args []string) error {
 }
 
 func cmdTOTPVerify(args []string) error {
+	args = normalizeArgs([]string{"secret", "code"}, args)
 	fl := flag.NewFlagSet("totp verify", flag.ContinueOnError)
 	secret := fl.String("secret", "", "base32-encoded shared secret")
 	code := fl.String("code", "", "6-digit code to check")
@@ -848,6 +897,7 @@ func scanDir(w io.Writer, dir string, threshold float64) (found, files int, err 
 }
 
 func cmdScan(args []string) error {
+	args = normalizeArgs([]string{"dir", "entropy"}, args)
 	fl := flag.NewFlagSet("scan", flag.ContinueOnError)
 	dir := fl.String("dir", "", "directory to scan recursively (default: current directory)")
 	threshold := fl.Float64("entropy", 4.5, "Shannon entropy threshold in bits per character")
@@ -929,6 +979,7 @@ func genPassword(length int, symbols bool) ([]byte, []string) {
 }
 
 func cmdGen(args []string) error {
+	args = normalizeArgs([]string{"len", "symbols", "copy"}, args)
 	fl := flag.NewFlagSet("gen", flag.ContinueOnError)
 	length := fl.Int("len", 20, "password length (minimum 8)")
 	symbols := fl.Bool("symbols", false, "include punctuation symbols")
@@ -987,6 +1038,7 @@ func hashFile(path, algo string) (string, error) {
 }
 
 func cmdHash(args []string) error {
+	args = normalizeArgs([]string{"file", "algo"}, args)
 	fl := flag.NewFlagSet("hash", flag.ContinueOnError)
 	path := fl.String("file", "", "file to hash")
 	algo := fl.String("algo", "sha256", "sha256 or sha512")
@@ -1409,7 +1461,7 @@ func cmdBench(_ []string) error {
 		nameFmt := fmt.Sprintf("%-22s", r.name)
 		valFmt := fmt.Sprintf("%-16s", r.result)
 		durFmt := dim(fmtDur(r.elapsed) + "/op")
-		line := green("▶")+" "+nameFmt+" "+valFmt
+		line := green("▶") + " " + nameFmt + " " + valFmt
 		// visible length: 1+1+22+1+16 = 41
 		pad := W - 41
 		if pad < 0 {
@@ -1760,7 +1812,7 @@ func menuEdit() error {
 	if err := runCrypt(tmpPath, inPath, pass, true, defaultRounds, false); err != nil {
 		return usagef("re-encryption failed: %v", err)
 	}
-	
+
 	fmt.Fprintln(os.Stderr)
 	drawCard("EDITED SUCCESSFULLY", [][2]string{
 		{"File", inPath},
@@ -1776,7 +1828,7 @@ func menuWipe() error {
 	if err != nil {
 		return err
 	}
-	
+
 	confirm, err := menuPromptStr(fmt.Sprintf("Type 'yes' to permanently shred %s", path), "")
 	if err != nil {
 		return err
@@ -2062,7 +2114,9 @@ func cmdCrypt(args []string, encrypt bool) error {
 			cleanArgs = append(cleanArgs, arg)
 		}
 	}
-	args = cleanArgs
+	// Normalize so flags appearing after positional args are still parsed correctly.
+	knownFlags := []string{"in", "out", "pass", "rounds"}
+	args = normalizeArgs(knownFlags, cleanArgs)
 
 	fl := flag.NewFlagSet(name, flag.ContinueOnError)
 	in := fl.String("in", "", "input file")
@@ -2117,6 +2171,7 @@ func cmdCrypt(args []string, encrypt bool) error {
 }
 
 func cmdView(args []string) error {
+	args = normalizeArgs([]string{"pass"}, args)
 	fl := flag.NewFlagSet("view", flag.ContinueOnError)
 	passFlag := fl.String("pass", "", "passphrase (prompted on stdin if omitted)")
 	if err := fl.Parse(args); err != nil {
@@ -2145,6 +2200,7 @@ func cmdView(args []string) error {
 }
 
 func cmdEdit(args []string) error {
+	args = normalizeArgs([]string{"pass"}, args)
 	fl := flag.NewFlagSet("edit", flag.ContinueOnError)
 	passFlag := fl.String("pass", "", "passphrase (prompted on stdin if omitted)")
 	if err := fl.Parse(args); err != nil {
@@ -2200,6 +2256,7 @@ func cmdEdit(args []string) error {
 }
 
 func cmdWipe(args []string) error {
+	args = normalizeArgs([]string{}, args)
 	fl := flag.NewFlagSet("wipe", flag.ContinueOnError)
 	if err := fl.Parse(args); err != nil {
 		return flagErr(err)

@@ -1,22 +1,17 @@
-# Binaries
-bastion
-bastion.exe
+# Compiled binaries
+/bastion
+/bastion.exe
 bastion.mac
 bastion.linux
 *.exe
 *~
 
-#Build output directory
+# Build output directory
 /dist/
 
-# Local data & testing
-*.enc
-*.dec
-*.txt
-*.key
-*.pem
-*.bin
-secret*
+# Local notes & rules
+*.local.md
+MY-RULES.local.md
 
 # Test & coverage artifacts
 coverage.out
@@ -25,10 +20,8 @@ coverage.out
 # OS
 .DS_Store
 Thumbs.db
-*.local.md
 
-# Go
+# Go workspace (local developer overrides)
 vendor/
 go.work
 go.work.sum
-coverage.out
