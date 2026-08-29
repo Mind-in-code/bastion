@@ -3,6 +3,11 @@ bastion
 bastion.exe
 bastion.mac
 bastion.linux
+*.exe
+*~
+
+#Build output directory
+/dist/
 
 # Local data & testing
 *.enc
@@ -13,9 +18,14 @@ bastion.linux
 *.bin
 secret*
 
+# Test & coverage artifacts
+coverage.out
+*.out
+
 # OS
 .DS_Store
 Thumbs.db
+*.local.md
 
 # Go
 vendor/
