@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -149,6 +150,13 @@ func disableEcho() func() {
 }
 
 func promptPassword(prompt string) ([]byte, error) {
+	// On a real Windows console, delegate to PowerShell Read-Host -AsSecureString
+	// which renders asterisks instead of echoing keystrokes. The guard on isTTY
+	// ensures the PowerShell path is never taken in automated pipelines or tests
+	// (where stdin is a pipe, not a terminal), so stdin-piped tests still pass.
+	if runtime.GOOS == "windows" && isTTY(os.Stdin) {
+		return readPasswordWindows(prompt)
+	}
 	fmt.Fprint(os.Stderr, prompt)
 	restore := disableEcho()
 	line, err := stdin.ReadString('\n')
@@ -158,6 +166,41 @@ func promptPassword(prompt string) ([]byte, error) {
 		return nil, usagef("could not read password: %v", err)
 	}
 	return []byte(strings.TrimRight(line, "\r\n")), nil
+}
+
+// readPasswordWindows reads a password on Windows consoles using PowerShell's
+// Read-Host -AsSecureString, which shows asterisks instead of echoing the
+// typed characters.  The SecureString is immediately converted back to a plain
+// string and captured from the subprocess stdout — it never appears on screen.
+// If PowerShell is unavailable the function falls back to a plain buffered read.
+func readPasswordWindows(prompt string) ([]byte, error) {
+	// Single-quoted prompt is safe because our prompts contain only printable
+	// ASCII without single-quote characters.
+	psCmd := `$p = Read-Host -AsSecureString '` + prompt + `'; ` +
+		`[Runtime.InteropServices.Marshal]::PtrToStringAuto(` +
+		`[Runtime.InteropServices.Marshal]::SecureStringToBSTR($p))`
+	cmd := exec.Command("powershell", "-NoProfile", "-Command", psCmd)
+	// Stderr is forwarded so any PowerShell error messages reach the user.
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	fmt.Fprintln(os.Stderr) // blank line after the masked input line
+	if err != nil {
+		// PowerShell unavailable or failed — fall back to a plain buffered read.
+		fmt.Fprint(os.Stderr, prompt)
+		restore := disableEcho()
+		line, rerr := stdin.ReadString('\n')
+		restore()
+		fmt.Fprintln(os.Stderr)
+		if rerr != nil && line == "" {
+			return nil, usagef("could not read password: %v", rerr)
+		}
+		return []byte(strings.TrimRight(line, "\r\n")), nil
+	}
+	pw := bytes.TrimRight(out, "\r\n")
+	if len(pw) == 0 {
+		return nil, usagef("could not read password via PowerShell")
+	}
+	return pw, nil
 }
 
 // resolvePass takes the -pass flag if given, otherwise prompts (twice when confirming).
@@ -350,7 +393,13 @@ func decryptStream(in *bufio.Reader, out io.Writer, pass []byte) error {
 	return openStream(gcm, hdr[saltLen+roundsLen:], in, out)
 }
 
-// runCrypt wires files to the streaming core, removing the output on any failure.
+// runCrypt wires files to the streaming core.
+//
+// Atomic guarantee: all output is written to <outPath>.tmp first. The temp
+// file is renamed to <outPath> only after the final AEAD tag is verified
+// (enc) or the complete ciphertext authenticated (dec). On any error the
+// temp file is removed, so the caller never sees a partial or
+// unauthenticated output file at the destination path.
 func runCrypt(inPath, outPath string, pass []byte, encrypt bool, rounds int) error {
 	defer zero(pass)
 
@@ -360,7 +409,9 @@ func runCrypt(inPath, outPath string, pass []byte, encrypt bool, rounds int) err
 	}
 	defer src.Close()
 
-	dst, err := os.OpenFile(outPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// Write to a temp file so outPath is only ever complete + authenticated.
+	tmpPath := outPath + ".tmp"
+	dst, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return usagef("cannot create output: %v", err)
 	}
@@ -379,12 +430,18 @@ func runCrypt(inPath, outPath string, pass []byte, encrypt bool, rounds int) err
 	}
 
 	if err != nil {
-		os.Remove(outPath) // fail closed: never leave partial output behind
+		os.Remove(tmpPath) // fail closed: never leave a partial temp file behind
 		var e exitErr
 		if errors.As(err, &e) {
 			return err
 		}
 		return usagef("%v", err)
+	}
+
+	// AEAD tag fully verified — atomically publish the authenticated output.
+	if rerr := os.Rename(tmpPath, outPath); rerr != nil {
+		os.Remove(tmpPath)
+		return usagef("cannot finalize output: %v", rerr)
 	}
 
 	fi, _ := os.Stat(outPath)
@@ -512,7 +569,7 @@ var patterns = []struct {
 var tokenRE = regexp.MustCompile(`[A-Za-z0-9+/=_-]{20,}`)
 
 var skipDirs = map[string]bool{
-	".git": true, "node_modules": true, "vendor": true, "dist": true,
+	".git": true, ".svn": true, "node_modules": true, "vendor": true, "dist": true,
 	"build": true, "target": true, ".venv": true, "venv": true,
 	"__pycache__": true, ".idea": true, ".next": true, ".cache": true,
 }
@@ -790,6 +847,254 @@ func cmdHash(args []string) error {
 	return nil
 }
 
+// ---------------------------------------------------------------- interactive TUI menu
+
+// menuHeader is the ASCII box shown at the top of every menu screen.
+const menuHeader = "\n" +
+	"╔══════════════════════════════════════════════════════╗\n" +
+	"║      BASTION — Zero-Dependency Security Toolbox      ║\n" +
+	"╚══════════════════════════════════════════════════════╝"
+
+// menuPromptStr displays a labelled input prompt with an optional default value
+// and reads one line from stdin, returning the default when the user hits Enter.
+func menuPromptStr(label, def string) (string, error) {
+	if def != "" {
+		fmt.Fprintf(os.Stderr, "  %s [%s]: ", label, def)
+	} else {
+		fmt.Fprintf(os.Stderr, "  %s: ", label)
+	}
+	line, err := stdin.ReadString('\n')
+	if err != nil && line == "" {
+		return "", fmt.Errorf("input error: %v", err)
+	}
+	s := strings.TrimRight(line, "\r\n")
+	if s == "" {
+		return def, nil
+	}
+	return s, nil
+}
+
+// menuEncrypt interactively collects enc parameters and runs the encryption.
+func menuEncrypt() error {
+	inPath, err := menuPromptStr("Input file", "")
+	if err != nil || inPath == "" {
+		return usagef("input file is required")
+	}
+	outPath, err := menuPromptStr("Output file", inPath+".enc")
+	if err != nil {
+		return err
+	}
+	if inPath == outPath {
+		return usagef("input and output must be different files")
+	}
+	pass, err := resolvePass("", true)
+	if err != nil {
+		return err
+	}
+	return runCrypt(inPath, outPath, pass, true, defaultRounds)
+}
+
+// menuDecrypt interactively collects dec parameters and runs the decryption.
+func menuDecrypt() error {
+	inPath, err := menuPromptStr("Input file", "")
+	if err != nil || inPath == "" {
+		return usagef("input file is required")
+	}
+	// Sensible default: strip .enc, or append .dec if there is no .enc suffix.
+	defOut := strings.TrimSuffix(inPath, ".enc")
+	if defOut == inPath {
+		defOut = inPath + ".dec"
+	}
+	outPath, err := menuPromptStr("Output file", defOut)
+	if err != nil {
+		return err
+	}
+	if inPath == outPath {
+		return usagef("input and output must be different files")
+	}
+	pass, err := resolvePass("", false)
+	if err != nil {
+		return err
+	}
+	return runCrypt(inPath, outPath, pass, false, 0)
+}
+
+// menuTOTP interactively runs TOTP gen or verify.
+func menuTOTP() error {
+	fmt.Fprintln(os.Stderr, "  "+yellow("[a]")+(" Generate code   ")+yellow("[b]")+" Verify code")
+	fmt.Fprint(os.Stderr, "  Mode [a]: ")
+	modeLine, _ := stdin.ReadString('\n')
+	mode := strings.TrimRight(modeLine, "\r\n ")
+
+	secret, err := menuPromptStr("Base32 secret", "")
+	if err != nil || secret == "" {
+		return usagef("base32 secret is required")
+	}
+
+	if strings.EqualFold(mode, "b") {
+		code, err := menuPromptStr("6-digit code", "")
+		if err != nil || code == "" {
+			return usagef("code is required")
+		}
+		ok, err := totpVerify(secret, code, time.Now().Unix())
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return secf("INVALID code")
+		}
+		okf("VALID code (within ±1 time step)")
+		return nil
+	}
+
+	now := time.Now().Unix()
+	code, err := totpAt(secret, now)
+	if err != nil {
+		return err
+	}
+	left := totpStep - now%totpStep
+	fmt.Println(green(code))
+	notef("valid for %ds", left)
+	if left <= 5 {
+		warnf("this code expires in %ds — wait for the next one if you are cutting it close", left)
+	}
+	return nil
+}
+
+// menuScan interactively collects a directory path and runs the secret scanner.
+func menuScan() error {
+	dir, err := menuPromptStr("Directory to scan", ".")
+	if err != nil {
+		return err
+	}
+	info, statErr := os.Stat(dir)
+	if statErr != nil || !info.IsDir() {
+		return usagef("not a directory: %s", dir)
+	}
+	total, files, err := scanDir(os.Stdout, dir, 4.5)
+	if err != nil {
+		return usagef("scan failed: %v", err)
+	}
+	notef("scanned %d files in %s", files, dir)
+	if total > 0 {
+		return secf("%d potential secret(s) found", total)
+	}
+	okf("No secrets found")
+	return nil
+}
+
+// menuGen interactively generates a random password.
+func menuGen() error {
+	lenStr, err := menuPromptStr("Password length", "24")
+	if err != nil {
+		return err
+	}
+	var length int
+	if _, e := fmt.Sscanf(lenStr, "%d", &length); e != nil || length < 8 {
+		return usagef("invalid length %q (minimum 8)", lenStr)
+	}
+	symStr, err := menuPromptStr("Include symbols? (y/n)", "y")
+	if err != nil {
+		return err
+	}
+	symbols := !strings.EqualFold(strings.TrimSpace(symStr), "n")
+	pw, classes := genPassword(length, symbols)
+	pool := strings.Join(classes, "")
+	fmt.Println(green(string(pw)))
+	notef("%d chars, ~%.0f bits of entropy", length, float64(length)*math.Log2(float64(len(pool))))
+	zero(pw)
+	return nil
+}
+
+// menuHash interactively streams a file through a hash function.
+func menuHash() error {
+	path, err := menuPromptStr("File path", "")
+	if err != nil || path == "" {
+		return usagef("file path is required")
+	}
+	algo, err := menuPromptStr("Algorithm (sha256/sha512)", "sha256")
+	if err != nil {
+		return err
+	}
+	sum, err := hashFile(path, algo)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s  %s\n", green(sum), path)
+	return nil
+}
+
+// cmdMenu is an interactive REPL menu launched when bastion is run without
+// subcommands (or with the explicit "menu" subcommand) in a terminal.
+//
+// When stdout is not a TTY (automated pipelines, test harnesses) the function
+// falls back to the plain usage banner and exits 1, preserving the historic
+// behaviour that the test suite relies on.
+func cmdMenu() error {
+	if !isTTY(os.Stdout) {
+		fmt.Fprint(os.Stderr, usageText)
+		return errQuiet(exitUsage)
+	}
+
+	menuItems := []string{
+		dim("  [1]") + " Encrypt File",
+		dim("  [2]") + " Decrypt File",
+		dim("  [3]") + " 2FA / TOTP Authenticator",
+		dim("  [4]") + " Scan Directory for Leaked Secrets",
+		dim("  [5]") + " Generate Secure Password",
+		dim("  [6]") + " Compute File Checksum",
+		dim("  [7]") + " CLI Help Reference",
+		dim("  [0]") + " Exit",
+	}
+
+	for {
+		fmt.Fprintln(os.Stderr, green(menuHeader))
+		fmt.Fprintln(os.Stderr)
+		for _, item := range menuItems {
+			fmt.Fprintln(os.Stderr, item)
+		}
+		fmt.Fprint(os.Stderr, "\n  Choice: ")
+
+		line, err := stdin.ReadString('\n')
+		if err != nil {
+			// EOF (Ctrl+D) — exit the REPL cleanly.
+			fmt.Fprintln(os.Stderr)
+			return nil
+		}
+		choice := strings.TrimRight(line, "\r\n ")
+		fmt.Fprintln(os.Stderr)
+
+		var runErr error
+		switch choice {
+		case "0", "q", "quit", "exit":
+			fmt.Fprintln(os.Stderr, dim("Goodbye."))
+			return nil
+		case "1":
+			runErr = menuEncrypt()
+		case "2":
+			runErr = menuDecrypt()
+		case "3":
+			runErr = menuTOTP()
+		case "4":
+			runErr = menuScan()
+		case "5":
+			runErr = menuGen()
+		case "6":
+			runErr = menuHash()
+		case "7":
+			fmt.Fprint(os.Stderr, usageText)
+		default:
+			warnf("Unknown choice %q — enter a number from 0 to 7.", choice)
+		}
+
+		if runErr != nil {
+			// Report the error but stay in the REPL — let the user try again.
+			fmt.Fprintln(os.Stderr, red("✘ ")+runErr.Error())
+		}
+		fmt.Fprintln(os.Stderr)
+	}
+}
+
 // ---------------------------------------------------------------- CLI
 
 // flagErr maps the flag package's outcome onto our exit codes. The flag package
@@ -842,14 +1147,16 @@ func cmdCrypt(args []string, encrypt bool) error {
 const usageText = `bastion — zero-dependency security toolbox
 
 USAGE
+  bastion                                                  interactive menu (requires a TTY)
+  bastion menu                                             same as above
   bastion enc  -in <file> -out <file> [-pass <pass>] [-rounds <n>]
-                                                         encrypt a file (AES-256-GCM)
-  bastion dec  -in <file> -out <file> [-pass <pass>]     decrypt a file (exit 2 if tampered)
-  bastion totp gen    -secret <base32>                   generate a 6-digit TOTP code
-  bastion totp verify -secret <base32> -code <code>      verify a code (±1 step drift)
-  bastion scan -dir <path> [-entropy <float>]            hunt for leaked secrets
-  bastion gen  [-len <int>] [-symbols]                   generate a strong password
-  bastion hash -file <file> [-algo sha256|sha512]        stream-hash a file
+                                                           encrypt a file (AES-256-GCM)
+  bastion dec  -in <file> -out <file> [-pass <pass>]       decrypt a file (exit 2 if tampered)
+  bastion totp gen    -secret <base32>                     generate a 6-digit TOTP code
+  bastion totp verify -secret <base32> -code <code>        verify a code (±1 step drift)
+  bastion scan -dir <path> [-entropy <float>]              hunt for leaked secrets
+  bastion gen  [-len <int>] [-symbols]                     generate a strong password
+  bastion hash -file <file> [-algo sha256|sha512]          stream-hash a file
 
 EXIT CODES
   0  success        1  bad arguments or I/O error        2  tamper / secret found
@@ -859,10 +1166,14 @@ EXIT CODES
 // main is the only place that calls os.Exit, which keeps all of this testable.
 func dispatch(args []string) error {
 	if len(args) == 0 {
-		fmt.Fprint(os.Stderr, usageText)
-		return errQuiet(exitUsage)
+		// No subcommand: launch the interactive menu when stdout is a TTY,
+		// otherwise fall back to the usage banner (preserves historic exit-1
+		// behaviour for scripts and the automated test suite).
+		return cmdMenu()
 	}
 	switch args[0] {
+	case "menu":
+		return cmdMenu()
 	case "enc":
 		return cmdCrypt(args[1:], true)
 	case "dec":
